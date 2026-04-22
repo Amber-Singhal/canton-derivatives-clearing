@@ -1,0 +1,82 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module MarginAccount where
+
+import DA.Assert ((assertMsg))
+import TradeAgreement (TradeAgreement)
+
+-- | Represents a margin account for a specific bilateral trade, managed by a
+-- | central clearinghouse. This contract holds the initial margin from both
+-- | parties and tracks the daily variation margin adjustments.
+-- | The lifecycle of this contract is tied to the underlying `TradeAgreement`.
+-- | It is created when the trade is cleared and archived when the trade is settled.
+template MarginAccount
+  with
+    clearinghouse   : Party
+      -- ^ The central counterparty (CCP) managing the account.
+    partyA          : Party
+      -- ^ The first counterparty of the trade.
+    partyB          : Party
+      -- ^ The second counterparty of the trade.
+    tradeAgreementCid : ContractId TradeAgreement
+      -- ^ The underlying trade agreement this margin account collateralizes.
+    initialMarginA  : Decimal
+      -- ^ The initial margin posted by Party A. Must be non-negative.
+    initialMarginB  : Decimal
+      -- ^ The initial margin posted by Party B. Must be non-negative.
+    variationMarginA: Decimal
+      -- ^ The cumulative variation margin for Party A based on daily Mark-to-Market (MTM) changes.
+      -- | This value represents the net profit or loss for Party A since inception.
+      -- | A positive value means Party B owes Party A. A negative value means Party A owes Party B.
+      -- | The variation margin for Party B is always the negation of this value.
+    currency        : Text
+      -- ^ The currency of all margin amounts (e.g., "USD").
+  where
+    signatory clearinghouse
+    observer partyA, partyB
+
+    key (clearinghouse, tradeAgreementCid) : (Party, ContractId TradeAgreement)
+    maintainer key._1
+
+    ensure
+      initialMarginA >= 0.0 && initialMarginB >= 0.0
+
+    -- | Calculates the net variation margin for Party B. It is always the
+    -- | inverse of Party A's variation margin, reflecting the zero-sum nature
+    -- | of the derivative's PnL.
+    let variationMarginB = -variationMarginA
+
+    -- | The clearinghouse can update the variation margin based on the daily
+    -- | Mark-to-Market (MTM) calculation for the underlying trade.
+    choice UpdateVariationMargin : ContractId MarginAccount
+      with
+        -- | The new cumulative PnL for Party A since the trade inception.
+        -- | This value replaces the old `variationMarginA`.
+        newCumulativePnlA : Decimal
+      controller clearinghouse
+      do
+        -- This choice updates the total VM balance on-ledger. In a full implementation,
+        -- the daily cash settlement of the margin call (the difference between
+        -- yesterday's and today's VM) would be handled by a separate process,
+        -- likely involving fungible token transfers.
+        create this with
+          variationMarginA = newCumulativePnlA
+
+    -- | The clearinghouse can close the margin account once the underlying trade
+    -- | has been terminated or has expired. This would typically follow the final
+    -- | settlement of the trade.
+    choice CloseAccount : ()
+      controller clearinghouse
+      do
+        -- In a production system, this choice would be more complex. It would:
+        -- 1. Fetch the TradeAgreement contract to verify its status is 'Settled' or 'Terminated'.
+        --    (e.g., `tradeData <- fetch tradeAgreementCid; assert (tradeData.isSettled)`)
+        -- 2. Calculate the final settlement amounts for each party:
+        --    - partyAReturn = initialMarginA + variationMarginA
+        --    - partyBReturn = initialMarginB + variationMarginB
+        -- 3. Trigger choices on fungible token contracts (e.g., a stablecoin)
+        --    to transfer these settlement amounts back to the respective parties.
+        -- 4. Only upon successful settlement would this MarginAccount be archived.
+        -- For simplicity in this example, we just archive the contract.
+        pure ()
