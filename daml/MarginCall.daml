@@ -1,0 +1,96 @@
+module Clearing.MarginCall where
+
+import Daml.Script
+import DA.Date as Date
+import DA.Time (Time)
+import Clearing.TradeAgreement (TradeAgreement)
+import Clearing.MarginAccount (MarginAccount)
+
+-- | Represents the status of a margin call.
+data MarginCallStatus
+  = Pending     -- ^ The margin call has been issued and is awaiting settlement.
+  | Settled     -- ^ The margin has been successfully paid by the payer.
+  | Disputed    -- ^ One of the counterparties has disputed the margin call amount or terms.
+  | Expired     -- ^ The settlement deadline has passed without payment.
+  deriving (Eq, Show, Ord)
+
+-- | Represents a demand for variation margin from one party to another,
+-- | overseen by a central clearinghouse. This contract is created based on the
+-- | daily Mark-to-Market (MTM) valuation of an underlying derivative trade.
+template MarginCall
+  with
+    clearinghouse           : Party
+      -- ^ The central clearing party overseeing the margin process.
+    payer                   : Party
+      -- ^ The counterparty required to post additional margin.
+    receiver                : Party
+      -- ^ The counterparty entitled to receive the margin payment.
+    tradeAgreementCid       : ContractId TradeAgreement
+      -- ^ The identifier of the underlying trade agreement this margin call relates to.
+    marginCallId            : Text
+      -- ^ A unique identifier for this specific margin call, e.g., "YYYYMMDD-TradeID".
+    valuationDate           : Date
+      -- ^ The date for which the MTM valuation was calculated.
+    marginAmount            : Decimal
+      -- ^ The positive amount of variation margin required.
+    settlementDeadline      : Time
+      -- ^ The timestamp by which the margin payment must be completed.
+    status                  : MarginCallStatus
+      -- ^ The current status of the margin call.
+    payerMarginAccountCid   : ContractId MarginAccount
+      -- ^ The margin account from which the payer will transfer funds.
+    receiverMarginAccountCid : ContractId MarginAccount
+      -- ^ The margin account to which the receiver will receive funds.
+  where
+    signatory clearinghouse, payer, receiver
+
+    ensure marginAmount > 0.0
+
+    key (clearinghouse, tradeAgreementCid, marginCallId) : (Party, ContractId TradeAgreement, Text)
+    maintainer key._1
+
+    -- | Allows the payer to settle the margin call by transferring the required
+    -- | amount from their margin account to the receiver's account. This action
+    -- | must be completed before the settlement deadline.
+    choice Settle : ContractId MarginCall
+      controller payer
+      do
+        now <- getTime
+        assertMsg "Settlement deadline has passed" (now <= settlementDeadline)
+        assertMsg "Margin call is not in a 'Pending' state" (status == Pending)
+
+        -- Atomically exercise the choice on the payer's margin account to
+        -- transfer the funds to the receiver's account.
+        exercise payerMarginAccountCid TransferMargin with
+          receiverAccountCid = receiverMarginAccountCid
+          transferAmount = marginAmount
+
+        -- Recreate the contract with an updated status to reflect settlement.
+        create this with status = Settled
+
+    -- | Allows either the payer or receiver to formally dispute the margin call.
+    -- | This would typically trigger an out-of-band dispute resolution process.
+    choice Dispute : ContractId MarginCall
+      with
+        reason : Text
+          -- ^ A description of the reason for the dispute.
+      controller payer, receiver
+      do
+        assertMsg "Margin call must be in a 'Pending' state to be disputed" (status == Pending)
+        assertMsg "Dispute reason cannot be empty" (reason /= "")
+
+        -- Recreate the contract with a 'Disputed' status.
+        create this with status = Disputed
+
+    -- | Allows the clearinghouse to mark the margin call as expired if the
+    -- | settlement deadline has passed without action from the payer. This
+    -- | would typically trigger default management procedures.
+    choice MarkAsExpired : ContractId MarginCall
+      controller clearinghouse
+      do
+        now <- getTime
+        assertMsg "Settlement deadline has not yet passed" (now > settlementDeadline)
+        assertMsg "Margin call must be in a 'Pending' state to be marked as expired" (status == Pending)
+
+        -- Recreate the contract with an 'Expired' status.
+        create this with status = Expired
