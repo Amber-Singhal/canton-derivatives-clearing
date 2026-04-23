@@ -1,181 +1,326 @@
--- | This module defines the templates for creating and agreeing upon the terms
--- | of a bilateral Over-The-Counter (OTC) derivative trade. It follows a standard
--- | proposal/acceptance pattern, resulting in an `AgreedTrade` contract that is
--- | signed by both counterparties. This agreed contract serves as the basis for
--- | subsequent clearing and margin management processes.
---
--- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
--- SPDX-License-Identifier: Apache-2.0
+-- | This module defines the core templates for establishing and managing
+-- | bilateral OTC derivative trade agreements between two counterparties.
+-- | It follows a standard proposal-acceptance pattern to create a legally
+-- | binding agreement, which then serves as the golden source of trade
+-- | terms for downstream processes like margining and settlement.
 module TradeAgreement where
 
 import Daml.Script
-import DA.Date
-import DA.Assert
+import DA.Date as Date
+import DA.Assert ((===))
+import DA.Set (Set)
+import qualified DA.Set as Set
 
--- | Represents the core economic terms of a bilateral derivative trade.
--- | This data type is used in both the proposal and the final agreed trade.
-data TradeDetails = TradeDetails
-  with
-    tradeId : Text
-    -- ^ A unique identifier for the trade, e.g., an internal system ID.
-    tradeDate : Date
+-- | Encapsulates the economic details of an OTC derivative trade.
+-- | This data type is designed to be generic enough to support various
+-- | product types through its 'productDescription' field. For more
+-- | complex, structured products, this could be evolved into a variant type.
+data TradeDetails = TradeDetails with
+  tradeId: Text
+    -- ^ A unique identifier for the trade, agreed upon by the counterparties.
+  tradeDate: Date
     -- ^ The date on which the trade was executed.
-    effectiveDate : Date
-    -- ^ The date from which the trade's terms are effective.
-    maturityDate : Date
+  effectiveDate: Date
+    -- ^ The date from which the trade's terms and calculations begin.
+  maturityDate: Date
     -- ^ The date on which the trade expires and final settlement occurs.
-    productDescription : Text
-    -- ^ A human-readable description of the derivative product.
-    -- ^ e.g., "5Y USD Interest Rate Swap 3M LIBOR vs 2.5% Fixed"
-    notional : Decimal
-    -- ^ The principal amount of the trade.
-    currency : Text
+  notional: Decimal
+    -- ^ The principal amount used to calculate payments. Must be positive.
+  currency: Text
     -- ^ The currency of the notional amount (e.g., "USD", "EUR").
-    masterAgreementId : Optional Text
-    -- ^ Optional reference to a governing master agreement, like an ISDA Master Agreement.
-  deriving (Eq, Show)
+  productDescription: Text
+    -- ^ A human-readable description of the derivative product (e.g.,
+    -- | "5Y USD Interest Rate Swap SOFR vs 3.5% Fixed").
+  deriving (Eq, Show, Ord)
 
--- | Represents a proposed derivative trade between two counterparties, awaiting acceptance.
--- | The proposer initiates the trade, and the counterparty can accept or decline it.
-template TradeProposal
+-- | Represents a proposal from one party to another to enter into a
+-- | derivative trade agreement. The proposal is unilateral and can be
+-- | withdrawn by the proposer or accepted/declined by the counterparty.
+template TradeAgreementProposal
   with
-    proposer : Party
+    proposer: Party
       -- ^ The party initiating the trade proposal.
-    counterparty : Party
-      -- ^ The party who must accept or decline the proposal.
-    clearinghouse : Party
-      -- ^ The designated central clearinghouse for this trade.
-    details : TradeDetails
+    counterparty: Party
+      -- ^ The party receiving the proposal.
+    clearingHouse: Party
+      -- ^ The designated clearing house, who will observe the final agreement.
+    tradeDetails: TradeDetails
       -- ^ The economic terms of the proposed trade.
   where
     signatory proposer
     observer counterparty
 
+    key (proposer, counterparty, tradeDetails.tradeId) : (Party, Party, Text)
+    maintainer key._1
+
     ensure
       proposer /= counterparty &&
-      proposer /= clearinghouse &&
-      counterparty /= clearinghouse &&
-      details.effectiveDate >= details.tradeDate &&
-      details.maturityDate > details.effectiveDate &&
-      details.notional > 0.0
+      tradeDetails.notional > 0.0
 
-    choice Withdraw : ()
-      -- ^ The proposer can withdraw the proposal before it is accepted.
-      controller proposer
-      do
-        pure ()
-
-    choice Decline : ()
-      -- ^ The counterparty can decline the proposed trade terms.
+    -- | The counterparty accepts the trade proposal, creating a binding
+    -- | 'TradeAgreement' contract that is signed by both parties.
+    choice Accept : ContractId TradeAgreement
       controller counterparty
       do
-        pure ()
-
-    choice Accept : ContractId AgreedTrade
-      -- ^ The counterparty accepts the proposal, creating an `AgreedTrade` contract
-      -- ^ that is bilaterally signed by both trading parties.
-      controller counterparty
-      do
-        create AgreedTrade with
+        create TradeAgreement with
           partyA = proposer
           partyB = counterparty
-          clearinghouse
-          details
+          clearingHouse
+          tradeDetails
 
--- | Represents a bilaterally agreed derivative trade, signed by both counterparties.
--- | This contract serves as the definitive record of the trade terms before it is
--- | submitted to the clearinghouse for central clearing.
-template AgreedTrade
+    -- | The counterparty rejects the trade proposal. This archives the
+    -- | proposal contract.
+    choice Decline : ()
+      controller counterparty
+      do pure ()
+
+    -- | The proposer withdraws the trade proposal before it has been
+    -- | accepted. This archives the proposal contract.
+    choice Withdraw : ()
+      controller proposer
+      do pure ()
+
+-- | Represents a bilaterally-agreed-upon OTC derivative trade. This contract
+-- | is the single source of truth for the trade's terms and is signed by both
+-- | trading parties. It serves as the basis for all subsequent lifecycle
+-- | events, such as margin calls and settlement.
+template TradeAgreement
   with
-    partyA : Party
+    partyA: Party
       -- ^ One of the counterparties to the trade.
-    partyB : Party
+    partyB: Party
       -- ^ The other counterparty to the trade.
-    clearinghouse : Party
-      -- ^ The designated central clearinghouse.
-    details : TradeDetails
+    clearingHouse: Party
+      -- ^ The central clearing party, who acts as an observer.
+    tradeDetails: TradeDetails
       -- ^ The agreed-upon economic terms of the trade.
   where
     signatory partyA, partyB
-    observer clearinghouse
+    observer clearingHouse
+
+    key tradeDetails.tradeId : Text
+    maintainer (if partyA < partyB then partyA else partyB) -- canonical maintainer
 
     ensure
       partyA /= partyB &&
-      partyA /= clearinghouse &&
-      partyB /= clearinghouse
+      tradeDetails.notional > 0.0 &&
+      tradeDetails.maturityDate >= tradeDetails.effectiveDate &&
+      tradeDetails.effectiveDate >= tradeDetails.tradeDate
 
-    -- | A non-consuming choice to allow stakeholders to view the trade details.
+    -- | A non-consuming choice for any stakeholder to query the trade details.
     nonconsuming choice GetTradeDetails : TradeDetails
-      controller partyA, partyB, clearinghouse
-      do return details
+      controller partyA, partyB, clearingHouse
+      do
+        pure tradeDetails
 
--- | Daml Script to test the trade agreement workflow.
-testTradeAgreementFlow : Script ()
-testTradeAgreementFlow = script do
-  -- 1. Allocate parties for the test scenario.
+    -- | Initiates the process of novating one party's position to a new
+    -- | third party. This creates a 'NovationProposal' which must be
+    -- | accepted by the non-proposing original party and the new party.
+    choice RequestNovation : ContractId NovationProposal
+      with
+        partyToReplace: Party
+          -- ^ The party whose position will be novated (must be 'partyA' or 'partyB').
+        newParty: Party
+          -- ^ The new party taking over the position.
+      controller (if partyToReplace == partyA then partyA else partyB)
+      do
+        let proposer = signatory self
+        let otherParty = if partyToReplace == partyA then partyB else partyA
+        assertMsg "Party to replace must be one of the signatories"
+          (partyToReplace == partyA || partyToReplace == partyB)
+        assertMsg "New party cannot be one of the existing parties"
+          (newParty /= partyA && newParty /= partyB)
+
+        create NovationProposal with
+          proposingParty = proposer
+          otherOriginalParty = otherParty
+          partyToReplace
+          newParty
+          originalAgreementCid = self
+          originalTradeDetails = tradeDetails
+
+    -- | Initiates the process of mutually terminating the trade before its
+    -- | maturity date. This creates a 'TerminationProposal' that must be
+    -- | accepted by the other counterparty.
+    choice RequestTermination : ContractId TerminationProposal
+      with
+        terminationDate : Date
+          -- ^ The proposed date for early termination.
+      controller partyA, partyB
+      do
+        assertMsg "Termination date cannot be before trade date"
+          (terminationDate >= tradeDetails.tradeDate)
+        assertMsg "Termination date cannot be after maturity date"
+          (terminationDate <= tradeDetails.maturityDate)
+
+        create TerminationProposal with
+          proposer = signatory self
+          counterparty = if signatory self == partyA then partyB else partyA
+          originalAgreementCid = self
+
+-- | A proposal to novate a 'TradeAgreement' by replacing one of the
+-- | original parties with a new one. Requires consent from both the
+-- | non-proposing original party and the new incoming party.
+template NovationProposal
+  with
+    proposingParty: Party
+      -- ^ The original party who initiated the novation request.
+    otherOriginalParty: Party
+      -- ^ The other original party who must consent.
+    partyToReplace: Party
+      -- ^ The party being replaced in the trade.
+    newParty: Party
+      -- ^ The new party stepping into the trade.
+    originalAgreementCid: ContractId TradeAgreement
+      -- ^ The contract ID of the trade being novated.
+    originalTradeDetails: TradeDetails
+      -- ^ The details of the original trade for reference.
+  where
+    signatory proposingParty
+    observer otherOriginalParty, newParty
+
+    -- | The final confirmation choice that executes the novation.
+    -- | It requires the simultaneous consent of the non-proposing original
+    -- | party and the new party, who are both controllers.
+    choice ConfirmNovation : ContractId TradeAgreement
+      controller otherOriginalParty, newParty
+      do
+        -- Fetch original agreement to get all details, e.g., clearingHouse
+        originalAgreement <- fetch originalAgreementCid
+        
+        -- Archive the original agreement, consuming it atomically.
+        archive originalAgreementCid
+
+        -- Create the new agreement with the replaced party.
+        let (newPartyA, newPartyB) =
+              if partyToReplace == originalAgreement.partyA then
+                (newParty, originalAgreement.partyB)
+              else
+                (originalAgreement.partyA, newParty)
+
+        create TradeAgreement with
+          partyA = newPartyA
+          partyB = newPartyB
+          clearingHouse = originalAgreement.clearingHouse
+          tradeDetails = originalTradeDetails
+
+-- | A proposal to terminate a trade agreement early.
+template TerminationProposal
+  with
+    proposer: Party
+      -- ^ The party proposing the termination.
+    counterparty: Party
+      -- ^ The party who must accept the termination.
+    originalAgreementCid: ContractId TradeAgreement
+      -- ^ The contract ID of the trade to be terminated.
+  where
+    signatory proposer
+    observer counterparty
+
+    -- | The counterparty accepts the termination, which archives the
+    -- | original 'TradeAgreement' contract. In a full implementation,
+    -- | this would likely trigger a final settlement payment.
+    choice AcceptTermination : ()
+      controller counterparty
+      do
+        archive originalAgreementCid
+
+-- | Daml Script tests for the trade agreement workflow.
+test_TradeAgreementWorkflow = script do
   alice <- allocatePartyWithHint "Alice" (PartyIdHint "Alice")
   bob <- allocatePartyWithHint "Bob" (PartyIdHint "Bob")
-  ch <- allocatePartyWithHint "Clearinghouse" (PartyIdHint "Clearinghouse")
+  clearingHouse <- allocatePartyWithHint "ClearingHouse" (PartyIdHint "ClearingHouse")
 
-  let today = date 2024 Feb 26
-  let tradeDetails = TradeDetails with
-        tradeId = "TRADE-001"
-        tradeDate = today
-        effectiveDate = addDays today 2
-        maturityDate = date 2029 Feb 28
-        productDescription = "5Y USD Interest Rate Swap"
-        notional = 100_000_000.0
-        currency = "USD"
-        masterAgreementId = Some "ISDA-2002"
+  let
+    tradeId = "ISDA-12345"
+    today = Date.date 2024 Date.Jan 10
+    details = TradeDetails with
+      tradeId
+      tradeDate = today
+      effectiveDate = Date.addDays today 2
+      maturityDate = Date.addDays today (5 * 365)
+      notional = 100_000_000.0
+      currency = "USD"
+      productDescription = "5Y USD IRS SOFR vs 3.1%"
 
-  -- 2. Alice proposes a trade to Bob.
+  -- 1. Alice proposes a trade to Bob
   proposalCid <- submit alice do
-    createCmd TradeProposal with
+    createCmd TradeAgreementProposal with
       proposer = alice
       counterparty = bob
-      clearinghouse = ch
-      details = tradeDetails
-  debug "Alice proposed a trade to Bob."
+      clearingHouse
+      tradeDetails = details
 
-  -- 3. Bob accepts the trade, creating an AgreedTrade contract.
-  agreedTradeCid <- submit bob do
+  -- 2. Bob accepts the proposal
+  agreementCid <- submit bob do
     exerciseCmd proposalCid Accept
-  debug "Bob accepted the trade proposal."
 
-  -- 4. Verify the AgreedTrade contract exists and has the correct details.
-  agreedTradeContract <- fetch agreedTradeCid
-  agreedTradeContract.partyA === alice
-  agreedTradeContract.partyB === bob
-  agreedTradeContract.clearinghouse === ch
-  agreedTradeContract.details === tradeDetails
-  debug "Verified AgreedTrade contract details are correct."
+  -- 3. Verify the final agreement exists and has the correct details
+  agreement <- fetch agreementCid
+  agreement.partyA === alice
+  agreement.partyB === bob
+  agreement.clearingHouse === clearingHouse
+  agreement.tradeDetails.tradeId === tradeId
 
-  -- 5. Test the query choice by the clearinghouse.
-  queriedDetails <- submit ch do
-    exerciseCmd agreedTradeCid GetTradeDetails
-  queriedDetails === tradeDetails
-  debug "Clearinghouse successfully queried trade details."
-
-  -- 6. Test the Decline scenario.
-  proposalCid2 <- submit alice do
-    createCmd TradeProposal with
+  -- 4. Test decline proposal
+  let declineTradeId = "ISDA-DECLINE-TEST"
+  proposalToDeclineCid <- submit alice do
+    createCmd TradeAgreementProposal with
       proposer = alice
       counterparty = bob
-      clearinghouse = ch
-      details = tradeDetails with tradeId = "TRADE-002"
+      clearingHouse
+      tradeDetails = details with tradeId = declineTradeId
 
-  submit bob do exerciseCmd proposalCid2 Decline
-  debug "Tested counterparty decline scenario."
+  submit bob do exerciseCmd proposalToDeclineCid Decline
+  fetch_by_key @TradeAgreementProposal (alice, bob, declineTradeId) === None
 
-  -- 7. Test the Withdraw scenario.
-  proposalCid3 <- submit alice do
-    createCmd TradeProposal with
+  -- 5. Test withdraw proposal
+  let withdrawTradeId = "ISDA-WITHDRAW-TEST"
+  proposalToWithdrawCid <- submit alice do
+    createCmd TradeAgreementProposal with
       proposer = alice
       counterparty = bob
-      clearinghouse = ch
-      details = tradeDetails with tradeId = "TRADE-003"
+      clearingHouse
+      tradeDetails = details with tradeId = withdrawTradeId
 
-  submit alice do exerciseCmd proposalCid3 Withdraw
-  debug "Tested proposer withdraw scenario."
+  submit alice do exerciseCmd proposalToWithdrawCid Withdraw
+  fetch_by_key @TradeAgreementProposal (alice, bob, withdrawTradeId) === None
+
+  -- 6. Test Novation
+  charlie <- allocatePartyWithHint "Charlie" (PartyIdHint "Charlie")
+
+  -- Alice requests to novate her position to Charlie
+  novationProposalCid <- submit alice do
+    exerciseCmd agreementCid RequestNovation with partyToReplace = alice, newParty = charlie
+
+  -- Bob and Charlie must both consent to finalize the novation
+  newAgreementCid <- submitMulti [bob, charlie] [] do
+    exerciseCmd novationProposalCid ConfirmNovation
+
+  -- Verify old agreement is archived and new one exists
+  fetch agreementCid `shouldFail` pure ()
+
+  newAgreement <- fetch newAgreementCid
+  (Set.fromList [newAgreement.partyA, newAgreement.partyB]) === (Set.fromList [bob, charlie])
+  newAgreement.tradeDetails.tradeId === tradeId
+
+  -- 7. Test Termination
+  -- Create a new agreement to terminate
+  let termTradeId = "ISDA-TERM-TEST"
+  termProposalCid_setup <- submit bob do
+    createCmd TradeAgreementProposal with
+      proposer = bob, counterparty = alice, clearingHouse, tradeDetails = details with tradeId = termTradeId
+  termAgreementCid <- submit alice do exerciseCmd termProposalCid_setup Accept
+
+  -- Bob requests termination
+  termProposalCid <- submit bob do
+    exerciseCmd termAgreementCid RequestTermination with terminationDate = Date.addDays today 30
+
+  -- Alice accepts termination
+  submit alice do
+    exerciseCmd termProposalCid AcceptTermination
+
+  -- Verify the agreement is archived
+  fetch termAgreementCid `shouldFail` pure ()
 
   pure ()
