@@ -1,96 +1,291 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
 module Clearing.MarginCall where
 
+import DA.Date (Date, addDays)
+import DA.Optional (isSome, fromSome)
 import Daml.Script
-import DA.Date as Date
-import DA.Time (Time)
-import Clearing.TradeAgreement (TradeAgreement)
-import Clearing.MarginAccount (MarginAccount)
 
--- | Represents the status of a margin call.
-data MarginCallStatus
-  = Pending     -- ^ The margin call has been issued and is awaiting settlement.
-  | Settled     -- ^ The margin has been successfully paid by the payer.
-  | Disputed    -- ^ One of the counterparties has disputed the margin call amount or terms.
-  | Expired     -- ^ The settlement deadline has passed without payment.
-  deriving (Eq, Show, Ord)
+import Clearing.Trade.Base (TradeDetails)
 
--- | Represents a demand for variation margin from one party to another,
--- | overseen by a central clearinghouse. This contract is created based on the
--- | daily Mark-to-Market (MTM) valuation of an underlying derivative trade.
+-- A simplified representation of a cash-like asset for margin posting.
+-- In a production system, this would be replaced by a proper fungible token
+-- like one implementing Daml.Finance.Interface.Asset.Fungible.
+template Cash
+  with
+    owner    : Party
+    currency : Text
+    amount   : Decimal
+  where
+    signatory owner
+
+    -- Consumes this cash contract and splits it into two new ones.
+    choice Split : (ContractId Cash, ContractId Cash)
+      with
+        splitAmount: Decimal
+      controller owner
+      do
+        assertMsg "Split amount must be positive" (splitAmount > 0.0)
+        assertMsg "Split amount must be less than total amount" (splitAmount < amount)
+        cid1 <- create this with amount = splitAmount
+        cid2 <- create this with amount = amount - splitAmount
+        return (cid1, cid2)
+
+    -- Transfers ownership of the cash contract.
+    choice Transfer : ContractId Cash
+      with
+        newOwner: Party
+      controller owner
+      do
+        create this with owner = newOwner
+
+
+-- Represents a requirement for one party to post variation margin to the
+-- clearinghouse due to mark-to-market changes in a derivative trade's value.
 template MarginCall
   with
-    clearinghouse           : Party
-      -- ^ The central clearing party overseeing the margin process.
-    payer                   : Party
-      -- ^ The counterparty required to post additional margin.
-    receiver                : Party
-      -- ^ The counterparty entitled to receive the margin payment.
-    tradeAgreementCid       : ContractId TradeAgreement
-      -- ^ The identifier of the underlying trade agreement this margin call relates to.
-    marginCallId            : Text
-      -- ^ A unique identifier for this specific margin call, e.g., "YYYYMMDD-TradeID".
-    valuationDate           : Date
-      -- ^ The date for which the MTM valuation was calculated.
-    marginAmount            : Decimal
-      -- ^ The positive amount of variation margin required.
-    settlementDeadline      : Time
-      -- ^ The timestamp by which the margin payment must be completed.
-    status                  : MarginCallStatus
-      -- ^ The current status of the margin call.
-    payerMarginAccountCid   : ContractId MarginAccount
-      -- ^ The margin account from which the payer will transfer funds.
-    receiverMarginAccountCid : ContractId MarginAccount
-      -- ^ The margin account to which the receiver will receive funds.
+    clearinghouse  : Party
+    marginPoster   : Party
+    marginReceiver : Party
+    tradeId        : Text
+    tradeDetails   : TradeDetails
+    valuationDate  : Date
+    marginAmount   : Decimal -- Total amount required by this call
+    settledAmount  : Decimal -- Amount settled so far
+    dueDate        : Date
+    marginAsset    : Text    -- e.g., "USD"
   where
-    signatory clearinghouse, payer, receiver
+    signatory clearinghouse
+    observer marginPoster, marginReceiver
 
-    ensure marginAmount > 0.0
+    let outstandingAmount = marginAmount - settledAmount
 
-    key (clearinghouse, tradeAgreementCid, marginCallId) : (Party, ContractId TradeAgreement, Text)
+    key (clearinghouse, marginPoster, tradeId, valuationDate) : (Party, Party, Text, Date)
     maintainer key._1
 
-    -- | Allows the payer to settle the margin call by transferring the required
-    -- | amount from their margin account to the receiver's account. This action
-    -- | must be completed before the settlement deadline.
-    choice Settle : ContractId MarginCall
-      controller payer
+    ensure outstandingAmount > 0.0
+    ensure settledAmount >= 0.0
+    ensure marginAmount > settledAmount
+
+    -- Allows the MarginPoster to meet the call, either fully or partially.
+    -- If met fully, the call is archived and any excess cash (change) is returned.
+    -- If met partially, the provided cash is consumed, the call is archived,
+    -- and a new call is created for the remaining outstanding amount.
+    choice Settle_Partially
+      : (Optional (ContractId MarginCall), Optional (ContractId Cash))
+      -- Returns (optional new margin call CID, optional change cash CID)
+      with
+        settlementCashCid : ContractId Cash
+      controller marginPoster
       do
         now <- getTime
-        assertMsg "Settlement deadline has passed" (now <= settlementDeadline)
-        assertMsg "Margin call is not in a 'Pending' state" (status == Pending)
+        -- 1. Fetch and validate cash for settlement
+        cash <- fetch settlementCashCid
+        assertMsg ("Cash owner must be the margin poster, but was " <> show cash.owner)
+          (cash.owner == marginPoster)
+        assertMsg ("Cash currency must match margin asset type '" <> marginAsset <> "'")
+          (cash.currency == marginAsset)
+        assertMsg "Cannot settle with a zero or negative amount"
+          (cash.amount > 0.0)
 
-        -- Atomically exercise the choice on the payer's margin account to
-        -- transfer the funds to the receiver's account.
-        exercise payerMarginAccountCid TransferMargin with
-          receiverAccountCid = receiverMarginAccountCid
-          transferAmount = marginAmount
+        let postedAmount = cash.amount
 
-        -- Recreate the contract with an updated status to reflect settlement.
-        create this with status = Settled
+        -- 2. Archive the cash used for settlement
+        archive settlementCashCid
 
-    -- | Allows either the payer or receiver to formally dispute the margin call.
-    -- | This would typically trigger an out-of-band dispute resolution process.
-    choice Dispute : ContractId MarginCall
+        -- 3. Determine full vs. partial settlement
+        if postedAmount >= outstandingAmount then
+          -- Full (or over-) settlement
+          -- a. Credit the clearinghouse with the required amount
+          create Cash with owner = clearinghouse, currency = marginAsset, amount = outstandingAmount
+
+          -- b. Return change to the poster, if any
+          let changeAmount = postedAmount - outstandingAmount
+          changeCid <- if changeAmount > 0.0
+            then Some <$> create Cash with owner = marginPoster, currency = marginAsset, amount = changeAmount
+            else pure None
+
+          -- c. Create a receipt of the settlement for audit
+          create MarginCallSettled with
+            clearinghouse, marginPoster, marginReceiver, tradeId, valuationDate
+            settledOn = now
+            settledAmount = outstandingAmount
+            finalSettlement = True
+
+          -- d. Archive this margin call as it's now fully settled
+          archive self
+
+          -- e. Return no new margin call, but possibly change
+          return (None, changeCid)
+        else
+          -- Partial settlement
+          -- a. Credit the clearinghouse with the full posted amount
+          create Cash with owner = clearinghouse, currency = marginAsset, amount = postedAmount
+
+          -- b. Create a receipt for the partial settlement
+          create MarginCallSettled with
+            clearinghouse, marginPoster, marginReceiver, tradeId, valuationDate
+            settledOn = now
+            settledAmount = postedAmount
+            finalSettlement = False
+
+          -- c. Archive this margin call
+          archive self
+
+          -- d. Create a new margin call for the remainder
+          newMarginCallCid <- create this with settledAmount = self.settledAmount + postedAmount
+
+          -- e. Return the new margin call and no change
+          return (Some newMarginCallCid, None)
+
+    choice Dispute_Margin_Call : ContractId MarginDispute
       with
         reason : Text
-          -- ^ A description of the reason for the dispute.
-      controller payer, receiver
-      do
-        assertMsg "Margin call must be in a 'Pending' state to be disputed" (status == Pending)
-        assertMsg "Dispute reason cannot be empty" (reason /= "")
-
-        -- Recreate the contract with a 'Disputed' status.
-        create this with status = Disputed
-
-    -- | Allows the clearinghouse to mark the margin call as expired if the
-    -- | settlement deadline has passed without action from the payer. This
-    -- | would typically trigger default management procedures.
-    choice MarkAsExpired : ContractId MarginCall
-      controller clearinghouse
+      controller marginPoster, marginReceiver
       do
         now <- getTime
-        assertMsg "Settlement deadline has not yet passed" (now > settlementDeadline)
-        assertMsg "Margin call must be in a 'Pending' state to be marked as expired" (status == Pending)
+        create MarginDispute with
+          clearinghouse
+          disputingParty = signatory
+          tradeId
+          marginCallCid = self
+          reason
+          disputedOn = now
+          observers = [marginPoster, marginReceiver]
 
-        -- Recreate the contract with an 'Expired' status.
-        create this with status = Expired
+
+-- An archival record indicating that a margin call (or part of one) was settled.
+template MarginCallSettled
+  with
+    clearinghouse   : Party
+    marginPoster    : Party
+    marginReceiver  : Party
+    tradeId         : Text
+    valuationDate   : Date
+    settledOn       : Time
+    settledAmount   : Decimal
+    finalSettlement : Bool -- True if this settlement completed the call
+  where
+    signatory clearinghouse
+    observer marginPoster, marginReceiver
+
+
+-- Represents a dispute raised against a specific margin call.
+-- This would typically trigger an offline resolution process.
+template MarginDispute
+  with
+    clearinghouse   : Party
+    disputingParty  : Party
+    tradeId         : Text
+    marginCallCid   : ContractId MarginCall
+    reason          : Text
+    disputedOn      : Time
+    observers       : [Party]
+  where
+    signatory clearinghouse, disputingParty
+    observer observers
+
+    choice Resolve_Dispute : ()
+      with
+        resolutionDetails : Text
+      controller clearinghouse
+      do
+        -- In a real system, this would trigger further actions,
+        -- e.g., adjusting or cancelling the original margin call.
+        -- For now, we just archive the dispute contract.
+        archive self
+
+
+-- ====================================================================
+-- Test Script
+-- ====================================================================
+marginCallTests = script do
+  -- 1. Setup parties
+  clearinghouse <- allocatePartyWithHint "Clearinghouse" (PartyIdHint "clearinghouse")
+  alice <- allocatePartyWithHint "Alice" (PartyIdHint "alice")
+  bob <- allocatePartyWithHint "Bob" (PartyIdHint "bob")
+
+  -- Dummy trade details for testing
+  let trade = TradeDetails with
+        tradeId = "T123"
+        party1 = alice
+        party2 = bob
+        notional = 1_000_000.0
+        currency = "USD"
+        effectiveDate = date 2024 Jan 1
+        maturityDate = date 2025 Jan 1
+
+  let today = date 2024 Mar 15
+
+  -- 2. Clearinghouse issues a margin call to Alice
+  let marginCallAmount = 100_000.0
+  marginCallCid <- submit clearinghouse do
+    create MarginCall with
+      clearinghouse
+      marginPoster = alice
+      marginReceiver = bob
+      tradeId = trade.tradeId
+      tradeDetails = trade
+      valuationDate = today
+      marginAmount = marginCallAmount
+      settledAmount = 0.0
+      dueDate = addDays today 1
+      marginAsset = "USD"
+
+  -- 3. Test Partial Settlement
+  -- Alice only has 40,000 USD to post
+  aliceCashCid1 <- submit alice do
+    create Cash with owner = alice, currency = "USD", amount = 40_000.0
+
+  -- Alice makes a partial settlement
+  (newMarginCallCidOpt, changeCidOpt1) <- submit alice do
+    exercise marginCallCid Settle_Partially with settlementCashCid = aliceCashCid1
+
+  -- Assertions for partial settlement
+  assert (isSome newMarginCallCidOpt)
+  let newMarginCallCid = fromSome newMarginCallCidOpt
+  newMarginCall <- fetch newMarginCallCid
+  assert (changeCidOpt1 == None)
+  assert (newMarginCall.settledAmount == 40_000.0)
+  assert (newMarginCall.marginAmount == 100_000.0)
+  let outstanding = newMarginCall.marginAmount - newMarginCall.settledAmount
+  assert (outstanding == 60_000.0)
+  debug ("Partial settlement successful. Outstanding amount: " <> show outstanding)
+
+  -- 4. Test Full Settlement of the remaining amount
+  -- Alice gets more cash and settles the rest
+  aliceCashCid2 <- submit alice do
+    create Cash with owner = alice, currency = "USD", amount = 75_000.0 -- More than enough
+
+  -- Alice settles the remaining amount
+  (finalMarginCallCidOpt, changeCidOpt2) <- submit alice do
+    exercise newMarginCallCid Settle_Partially with settlementCashCid = aliceCashCid2
+
+  -- Assertions for full settlement
+  assert (finalMarginCallCidOpt == None)
+  assert (isSome changeCidOpt2)
+  let changeCid = fromSome changeCidOpt2
+  changeCash <- fetch changeCid
+  -- 75_000 posted - 60_000 outstanding = 15_000 change
+  assert (changeCash.amount == 15_000.0)
+  assert (changeCash.owner == alice)
+  debug ("Full settlement successful. Change returned: " <> show changeCash.amount)
+
+  -- Verify clearinghouse now holds the margin
+  chContracts <- query @Cash clearinghouse
+  let chBalance = sum (map (\(_, c) -> c.amount) chContracts)
+  assert (chBalance == 100_000.0) -- 40k from first settlement, 60k from second
+  debug ("Clearinghouse balance correct: " <> show chBalance)
+
+  -- Verify settled receipts were created
+  settledContracts <- query @MarginCallSettled clearinghouse
+  let partialReceipt = filter (\(_,c) -> not c.finalSettlement) settledContracts
+  let finalReceipt = filter (\(_,c) -> c.finalSettlement) settledContracts
+  assert (length partialReceipt == 1)
+  assert (length finalReceipt == 1)
+  assert ((snd partialReceipt.head).settledAmount == 40_000.0)
+  assert ((snd finalReceipt.head).settledAmount == 60_000.0)
+  debug "Settlement receipts created correctly."
+
+  return ()
