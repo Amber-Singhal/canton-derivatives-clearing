@@ -1,0 +1,206 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module ClearingTest where
+
+import Daml.Script
+import DA.Date
+import DA.Time
+import DA.Assert
+
+import TradeAgreement
+import MarginAccount
+import MarginCall
+import Novation
+
+-- === Test Setup ===
+
+-- Default trade details for use in tests
+defaultTradeDetails : TradeDetails
+defaultTradeDetails = TradeDetails
+  with
+    tradeId = "ISDA-2024-08-15-001"
+    effectiveDate = date 2024 Aug 15
+    terminationDate = date 2025 Aug 15
+    notional = 10_000_000.0
+    underlying = "USD/EUR FX Swap"
+    initialMtm = 0.0
+
+-- Default margin requirements
+defaultMarginReqs : MarginRequirements
+defaultMarginReqs = MarginRequirements
+  with
+    initialMargin = 500_000.0
+    currency = "USD"
+
+setupParties = script do
+  clearinghouse <- allocatePartyWithHint "Clearinghouse" (PartyIdHint "clearinghouse")
+  partyA <- allocatePartyWithHint "PartyA" (PartyIdHint "partyA")
+  partyB <- allocatePartyWithHint "PartyB" (PartyIdHint "partyB")
+  pure (clearinghouse, partyA, partyB)
+
+setupTradeAndMargin = script do
+  (clearinghouse, partyA, partyB) <- setupParties
+
+  -- 1. Agree on trade
+  proposalCid <- submit partyA do
+    createCmd TradeAgreementProposal with
+      proposer = partyA
+      accepter = partyB
+      clearinghouse
+      details = defaultTradeDetails
+      marginReqs = defaultMarginReqs
+
+  agreementCid <- submit partyB do
+    exerciseCmd proposalCid AcceptTradeAgreement
+
+  -- 2. Post Initial Margin and create account
+  -- In a real system, this would involve token transfers.
+  -- Here we simulate it by directly creating the funded margin account.
+  now <- getTime
+  marginAccountCid <- submit clearinghouse do
+    exerciseCmd agreementCid CreateMarginAccount with
+      partyACollateral = defaultMarginReqs.initialMargin
+      partyBCollateral = defaultMarginReqs.initialMargin
+      lastValuationTimestamp = now
+
+  pure (clearinghouse, partyA, partyB, marginAccountCid)
+
+-- === Test Cases ===
+
+testFullLifecycle : Script ()
+testFullLifecycle = script do
+  (clearinghouse, partyA, partyB, marginAccountCid) <- setupTradeAndMargin
+
+  -- 3. Mark-to-Market change leads to Margin Call
+  -- MTM moves in favor of Party A, so Party B must post VM.
+  let newMtm = 75_000.0
+  now <- getTime
+  marginCallCid <- submit clearinghouse do
+    exerciseCmd marginAccountCid IssueMarginCall with
+      newMtm
+      valuationTimestamp = now
+
+  -- 4. Party B posts Variation Margin
+  -- This would also involve a real token transfer. We simulate the settlement.
+  updatedMarginAccountCid <- submit partyB do
+    exerciseCmd marginCallCid PostVariationMargin with
+      postedAmount = newMtm
+
+  -- Verify state after VM posting
+  updatedMarginAccount <- queryContractId partyB updatedMarginAccountCid
+  updatedMarginAccount.partyBCollateral === (defaultMarginReqs.initialMargin + newMtm)
+  updatedMarginAccount.currentMtm === newMtm
+  queryContractId @MarginCall partyB marginCallCid === None -- assert margin call is consumed
+
+  -- 5. MTM moves back to zero
+  let finalMtm = 0.0
+  anotherCallCid <- submit clearinghouse do
+    exerciseCmd updatedMarginAccountCid IssueMarginCall with
+      newMtm = finalMtm
+      valuationTimestamp = now
+
+  -- Party A now owes a return of VM.
+  finalMarginAccountCid <- submit partyA do
+    exerciseCmd anotherCallCid PostVariationMargin with
+      postedAmount = -newMtm -- Negative amount signifies a return of collateral
+
+  finalMarginAccount <- queryContractId partyA finalMarginAccountCid
+  finalMarginAccount.partyBCollateral === defaultMarginReqs.initialMargin
+  finalMarginAccount.partyACollateral === defaultMarginReqs.initialMargin
+  finalMarginAccount.currentMtm === finalMtm
+
+  -- 6. Terminate trade at expiry
+  submit clearinghouse do
+    exerciseCmd finalMarginAccountCid TerminateTrade with
+      reason = "Trade expired as per termination date."
+
+  -- Verify all contracts related to the trade are gone
+  contracts <- query @MarginAccount partyA
+  contracts === []
+
+  pure ()
+
+
+testDefaultScenario : Script ()
+testDefaultScenario = script do
+  (clearinghouse, partyA, partyB, marginAccountCid) <- setupTradeAndMargin
+
+  -- 3. Issue a significant margin call to Party B
+  let newMtm = 120_000.0
+  now <- getTime
+  marginCallCid <- submit clearinghouse do
+    exerciseCmd marginAccountCid IssueMarginCall with
+      newMtm
+      valuationTimestamp = now
+
+  -- 4. Party B fails to post margin. Clearinghouse declares default.
+  -- The choice should have a time check, but we bypass for the test.
+  defaultedAccountCid <- submit clearinghouse do
+    exerciseCmd marginCallCid DeclareDefault
+
+  -- Verify margin account is now in defaulted state
+  defaultedAccount <- queryContractId clearinghouse defaultedAccountCid
+  defaultedAccount.status === Defaulted
+
+  -- 5. Clearinghouse liquidates position and settles funds
+  -- Assume liquidation costs are 5,000.0
+  let liquidationProceeds = 125_000.0 -- The loss covered by liquidating Party B's position
+  submit clearinghouse do
+    exerciseCmd defaultedAccountCid LiquidateAndSettle with
+      liquidationProceeds
+      liquidationCosts = 5_000.0
+
+  -- Final state check: The margin account contract should be archived.
+  contracts <- query @MarginAccount clearinghouse
+  contracts === []
+  -- In a real scenario, we'd check the token balances of parties.
+  -- Party A should have received their IM + MTM gain.
+  -- Party B should have lost their IM.
+  -- The clearinghouse would have taken the liquidation costs.
+  -- This test verifies the workflow completes and archives the state.
+  pure ()
+
+testNovationScenario : Script ()
+testNovationScenario = script do
+  (clearinghouse, partyA, partyB, originalMarginAccountCid) <- setupTradeAndMargin
+  partyC <- allocatePartyWithHint "PartyC" (PartyIdHint "partyC")
+
+  -- 3. Party A wants to exit, proposes novation to Party C
+  let novationDetails = NovationDetails with
+    exitingParty = partyA
+    remainingParty = partyB
+    incomingParty = partyC
+  proposalCid <- submit partyA do
+    exerciseCmd originalMarginAccountCid ProposeNovation with novationDetails
+
+  -- 4. Remaining party (B) and incoming party (C) accept
+  proposalCid_B_Accepted <- submit partyB do
+    exerciseCmd proposalCid AcceptNovation
+
+  proposalCid_C_Accepted <- submit partyC do
+    exerciseCmd proposalCid_B_Accepted AcceptNovation
+
+  -- 5. Clearinghouse executes the novation
+  (returnedCollateral, newMarginAccountCid) <- submit clearinghouse do
+    exerciseCmd proposalCid_C_Accepted ExecuteNovation with
+      incomingPartyCollateral = defaultMarginReqs.initialMargin -- Party C posts its IM
+
+  -- 6. Verify results
+  -- a. Exiting party's collateral was returned
+  returnedCollateral === defaultMarginReqs.initialMargin
+
+  -- b. Old margin account is archived
+  queryContractId @MarginAccount partyA originalMarginAccountCid === None
+
+  -- c. New margin account exists between B and C
+  newMarginAccount <- queryContractId partyB newMarginAccountCid
+  newMarginAccount.partyA === partyB
+  newMarginAccount.partyB === partyC
+  newMarginAccount.partyBCollateral === defaultMarginReqs.initialMargin
+  newMarginAccount.trade.details === defaultTradeDetails
+
+  -- d. Novation proposal is archived
+  queryContractId @NovationProposal clearinghouse proposalCid_C_Accepted === None
+
+  pure ()
