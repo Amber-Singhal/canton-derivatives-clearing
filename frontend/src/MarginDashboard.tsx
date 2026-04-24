@@ -1,193 +1,271 @@
-import React, { useMemo } from 'react';
-import { useParty, useStreamQueries } from '@c7/react';
-import { ClearedTrade } from '@daml.js/canton-derivatives-clearing-0.1.0/lib/Trade/ClearedTrade';
-import { InitialMarginAccount } from '@daml.js/canton-derivatives-clearing-0.1.0/lib/Margin/InitialMargin';
-import { VariationMarginMovement } from '@daml.js/canton-derivatives-clearing-0.1.0/lib/Margin/VariationMargin';
-import { Table, TableBody, TableCell, TableHead, TableRow, Paper, Typography, Grid, CircularProgress, Alert } from '@mui/material';
-import { styled } from '@mui/material/styles';
+import React from 'react';
+import { useStreamQueries, useLedger, useParty } from '@c7/react';
+import { ClearedTrade } from '@daml.js/canton-derivatives-clearing-0.1.0/lib/Main/ClearedTrade';
+import { MarginAccount } from '@daml.js/canton-derivatives-clearing-0.1.0/lib/Main/Margin';
+import { VariationMarginCall } from '@daml.js/canton-derivatives-clearing-0.1.0/lib/Main/Margin';
+import { TradeValuation } from '@daml.js/canton-derivatives-clearing-0.1.0/lib/Main/Valuation';
+import { ContractId } from '@daml/types';
 
-// Daml Decimal is a string, so we need functions to handle arithmetic
-const sumDecimals = (decimals: string[]): number => {
-  return decimals.reduce((acc, val) => acc + parseFloat(val), 0.0);
+// A simple styling object. In a real app, this might come from a CSS-in-JS library or a CSS file.
+const styles: { [key: string]: React.CSSProperties } = {
+  dashboard: {
+    fontFamily: '"Segoe UI", "Roboto", "Helvetica Neue", Arial, sans-serif',
+    padding: '24px',
+    maxWidth: '1280px',
+    margin: '0 auto',
+    color: '#333',
+  },
+  header: {
+    fontSize: '2.25rem',
+    fontWeight: 600,
+    marginBottom: '24px',
+    borderBottom: '1px solid #e0e0e0',
+    paddingBottom: '16px',
+  },
+  summaryContainer: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))',
+    gap: '24px',
+    marginBottom: '32px',
+  },
+  summaryCard: {
+    padding: '24px',
+    borderRadius: '8px',
+    boxShadow: '0 4px 6px rgba(0,0,0,0.05)',
+    border: '1px solid #e0e0e0',
+    backgroundColor: '#ffffff',
+    textAlign: 'center',
+  },
+  summaryLabel: {
+    fontSize: '1rem',
+    color: '#666',
+    marginBottom: '12px',
+    textTransform: 'uppercase',
+    letterSpacing: '0.5px',
+  },
+  summaryValue: {
+    fontSize: '2rem',
+    fontWeight: 700,
+  },
+  pnlPositive: {
+    color: '#28a745',
+  },
+  pnlNegative: {
+    color: '#dc3545',
+  },
+  section: {
+    marginBottom: '32px',
+  },
+  sectionTitle: {
+    fontSize: '1.75rem',
+    fontWeight: 600,
+    marginBottom: '16px',
+  },
+  table: {
+    width: '100%',
+    borderCollapse: 'collapse',
+    fontSize: '0.95rem',
+  },
+  th: {
+    borderBottom: '2px solid #ddd',
+    padding: '12px 16px',
+    textAlign: 'left',
+    backgroundColor: '#f7f7f7',
+    fontWeight: 600,
+  },
+  td: {
+    borderBottom: '1px solid #eee',
+    padding: '12px 16px',
+  },
+  loading: {
+    textAlign: 'center',
+    fontSize: '1.2em',
+    padding: '40px',
+    color: '#888',
+  },
+  noData: {
+    textAlign: 'center',
+    color: '#888',
+    padding: '24px',
+    backgroundColor: '#fafafa',
+    borderRadius: '8px',
+    border: '1px dashed #ddd',
+  },
+  button: {
+    padding: '8px 16px',
+    border: 'none',
+    borderRadius: '4px',
+    backgroundColor: '#007bff',
+    color: 'white',
+    cursor: 'pointer',
+    fontWeight: 600,
+    transition: 'background-color 0.2s',
+  },
+  buttonHover: {
+    backgroundColor: '#0056b3',
+  }
 };
 
-const formatCurrency = (amount: number): string => {
+const formatCurrency = (value: string | number): string => {
+  const num = typeof value === 'string' ? parseFloat(value) : value;
   return new Intl.NumberFormat('en-US', {
     style: 'currency',
     currency: 'USD',
-  }).format(amount);
+  }).format(num);
 };
 
-const getTodayDateString = (): string => {
-  // Daml Date serializes to "YYYY-MM-DD"
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = (now.getMonth() + 1).toString().padStart(2, '0');
-  const day = now.getDate().toString().padStart(2, '0');
-  return `${year}-${month}-${day}`;
-};
-
-const DashboardCard = styled(Paper)(({ theme }) => ({
-  padding: theme.spacing(2),
-  textAlign: 'center',
-  color: theme.palette.text.secondary,
-  height: '100%',
-  display: 'flex',
-  flexDirection: 'column',
-  justifyContent: 'center',
-}));
-
-const PnlPositive = styled('span')(({ theme }) => ({
-  color: theme.palette.success.main,
-  fontWeight: 500,
-}));
-
-const PnlNegative = styled('span')(({ theme }) => ({
-  color: theme.palette.error.main,
-  fontWeight: 500,
-}));
-
-const MarginDashboard: React.FC = () => {
+/**
+ * The main dashboard component for viewing margin accounts, P&L,
+ * and outstanding margin calls.
+ */
+export const MarginDashboard: React.FC = () => {
   const party = useParty();
+  const ledger = useLedger();
 
-  const tradeQueries = useStreamQueries(ClearedTrade);
-  const imAccountQueries = useStreamQueries(InitialMarginAccount);
-  const vmMovementQueries = useStreamQueries(VariationMarginMovement);
+  const { contracts: marginAccounts, loading: loadingAccounts } = useStreamQueries(MarginAccount, [{ owner: party }]);
+  const { contracts: trades, loading: loadingTrades } = useStreamQueries(ClearedTrade);
+  const { contracts: vmCalls, loading: loadingVmCalls } = useStreamQueries(VariationMarginCall);
+  const { contracts: valuations, loading: loadingValuations } = useStreamQueries(TradeValuation);
 
-  const isLoading = tradeQueries.loading || imAccountQueries.loading || vmMovementQueries.loading;
+  const loading = loadingAccounts || loadingTrades || loadingVmCalls || loadingValuations;
 
-  const summary = useMemo(() => {
-    if (!party || isLoading) {
-      return { totalIM: 0, netVM: 0, dailyPnl: 0, unrealizedPnl: 0 };
+  // Memoize derived data to prevent recalculations on every render
+  const { myAccount, myTrades, myOutstandingVmCalls, dailyPnl } = React.useMemo(() => {
+    const account = marginAccounts.length > 0 ? marginAccounts[0].payload : null;
+    const userTrades = trades.filter(t => t.payload.partyA === party || t.payload.partyB === party);
+    const outstandingCalls = vmCalls.filter(c => c.payload.status === "Pending" && (c.payload.payer === party || c.payload.receiver === party));
+
+    // A simplified P&L calculation based on settled VM today.
+    // A more accurate calculation would compare today's MTM with yesterday's.
+    const settledToday = vmCalls.filter(c =>
+      c.payload.status === "Settled" &&
+      (c.payload.payer === party || c.payload.receiver === party) &&
+      new Date(c.payload.settlementDate).toDateString() === new Date().toDateString()
+    );
+
+    const pnl = settledToday.reduce((acc, call) => {
+      const amount = parseFloat(call.payload.amount);
+      return call.payload.receiver === party ? acc + amount : acc - amount;
+    }, 0);
+
+    return { myAccount: account, myTrades: userTrades, myOutstandingVmCalls: outstandingCalls, dailyPnl: pnl };
+  }, [marginAccounts, trades, vmCalls, party]);
+
+  const getLatestValuation = React.useCallback((tradeId: string): string => {
+    const tradeValuations = valuations
+      .filter(v => v.payload.tradeId === tradeId)
+      .sort((a, b) => new Date(b.payload.valuationDate).getTime() - new Date(a.payload.valuationDate).getTime());
+    return tradeValuations.length > 0 ? tradeValuations[0].payload.mtmValue : "0.0";
+  }, [valuations]);
+
+  const handleSettleVmCall = async (cid: ContractId<VariationMarginCall>) => {
+    try {
+      // The choice to exercise depends on whether the user is the payer.
+      // We assume the payer is responsible for initiating the settlement transaction.
+      const vmCall = vmCalls.find(c => c.contractId === cid);
+      if (vmCall && vmCall.payload.payer === party) {
+        await ledger.exercise(VariationMarginCall.SettleCall, cid, {});
+        alert('Variation Margin Call settled successfully!');
+      } else {
+        alert('Only the designated payer can settle this margin call.');
+      }
+    } catch (error) {
+      console.error("Failed to settle VM Call:", error);
+      alert(`Error settling VM Call: ${error instanceof Error ? error.message : String(error)}`);
     }
-
-    const todayStr = getTodayDateString();
-
-    const totalIM = sumDecimals(imAccountQueries.contracts
-      .filter(c => c.payload.owner === party)
-      .map(c => c.payload.amount)
-    );
-
-    const paidVm = sumDecimals(vmMovementQueries.contracts
-      .filter(c => c.payload.payer === party)
-      .map(c => c.payload.amount)
-    );
-    const receivedVm = sumDecimals(vmMovementQueries.contracts
-      .filter(c => c.payload.receiver === party)
-      .map(c => c.payload.amount)
-    );
-    const netVM = receivedVm - paidVm;
-
-    const dailyVmMovements = vmMovementQueries.contracts.filter(c => c.payload.paymentDate === todayStr);
-
-    const dailyPaidVm = sumDecimals(dailyVmMovements
-      .filter(c => c.payload.payer === party)
-      .map(c => c.payload.amount)
-    );
-    const dailyReceivedVm = sumDecimals(dailyVmMovements
-      .filter(c => c.payload.receiver === party)
-      .map(c => c.payload.amount)
-    );
-    const dailyPnl = dailyReceivedVm - dailyPaidVm;
-
-    const unrealizedPnl = sumDecimals(tradeQueries.contracts.map(c => c.payload.markToMarket.value));
-
-    return { totalIM, netVM, dailyPnl, unrealizedPnl };
-
-  }, [party, tradeQueries.contracts, imAccountQueries.contracts, vmMovementQueries.contracts, isLoading]);
-
-  const PnlComponent = ({ value }: { value: number }) => {
-    const formattedValue = formatCurrency(value);
-    if (value >= 0) {
-      return <PnlPositive>{formattedValue}</PnlPositive>;
-    }
-    return <PnlNegative>{formattedValue}</PnlNegative>;
   };
 
-  if (isLoading) {
-    return (
-      <Grid container justifyContent="center" alignItems="center" style={{ height: '50vh' }}>
-        <CircularProgress />
-      </Grid>
-    );
+
+  if (loading) {
+    return <div style={styles.loading}>Loading Margin Dashboard...</div>;
   }
 
   return (
-    <div style={{ padding: '24px' }}>
-      <Typography variant="h4" gutterBottom>
-        Margin & P&L Dashboard
-      </Typography>
+    <div style={styles.dashboard}>
+      <h1 style={styles.header}>Margin Dashboard</h1>
 
-      <Grid container spacing={3} style={{ marginBottom: '2rem' }}>
-        <Grid item xs={12} sm={6} md={3}>
-          <DashboardCard elevation={3}>
-            <Typography variant="subtitle1">Total Initial Margin</Typography>
-            <Typography variant="h4">{formatCurrency(summary.totalIM)}</Typography>
-          </DashboardCard>
-        </Grid>
-        <Grid item xs={12} sm={6} md={3}>
-          <DashboardCard elevation={3}>
-            <Typography variant="subtitle1">Net Variation Margin</Typography>
-            <Typography variant="h4"><PnlComponent value={summary.netVM} /></Typography>
-            <Typography variant="body2">(Cumulative)</Typography>
-          </DashboardCard>
-        </Grid>
-        <Grid item xs={12} sm={6} md={3}>
-          <DashboardCard elevation={3}>
-            <Typography variant="subtitle1">Daily P&L (Realized)</Typography>
-            <Typography variant="h4"><PnlComponent value={summary.dailyPnl} /></Typography>
-             <Typography variant="body2">(Today's VM)</Typography>
-          </DashboardCard>
-        </Grid>
-        <Grid item xs={12} sm={6} md={3}>
-          <DashboardCard elevation={3}>
-            <Typography variant="subtitle1">Unrealized P&L</Typography>
-            <Typography variant="h4"><PnlComponent value={summary.unrealizedPnl} /></Typography>
-            <Typography variant="body2">(Current MTM)</Typography>
-          </DashboardCard>
-        </Grid>
-      </Grid>
+      <div style={styles.summaryContainer}>
+        <div style={styles.summaryCard}>
+          <div style={styles.summaryLabel}>Initial Margin (IM)</div>
+          <div style={styles.summaryValue}>{formatCurrency(myAccount?.initialMargin ?? '0.0')}</div>
+        </div>
+        <div style={styles.summaryCard}>
+          <div style={styles.summaryLabel}>Variation Margin (VM)</div>
+          <div style={styles.summaryValue}>{formatCurrency(myAccount?.variationMargin ?? '0.0')}</div>
+        </div>
+        <div style={styles.summaryCard}>
+          <div style={styles.summaryLabel}>Daily P&L (Settled VM)</div>
+          <div style={{ ...styles.summaryValue, ...(dailyPnl >= 0 ? styles.pnlPositive : styles.pnlNegative) }}>
+            {formatCurrency(dailyPnl)}
+          </div>
+        </div>
+      </div>
 
-      <Typography variant="h5" gutterBottom style={{ marginTop: '2rem' }}>
-        Active Trades
-      </Typography>
-
-      {tradeQueries.contracts.length === 0 ? (
-        <Alert severity="info">No active trades found for party {party}.</Alert>
-      ) : (
-        <Paper>
-          <Table>
-            <TableHead>
-              <TableRow>
-                <TableCell sx={{ fontWeight: 'bold' }}>Trade ID</TableCell>
-                <TableCell sx={{ fontWeight: 'bold' }}>Counterparty</TableCell>
-                <TableCell sx={{ fontWeight: 'bold' }}>Product</TableCell>
-                <TableCell sx={{ fontWeight: 'bold' }} align="right">Notional</TableCell>
-                <TableCell sx={{ fontWeight: 'bold' }} align="right">MTM</TableCell>
-                <TableCell sx={{ fontWeight: 'bold' }}>Maturity</TableCell>
-              </TableRow>
-            </TableHead>
-            <TableBody>
-              {tradeQueries.contracts.map(({ contractId, payload }) => (
-                <TableRow key={contractId} hover>
-                  <TableCell component="th" scope="row">{payload.tradeId}</TableCell>
-                  <TableCell>
-                    {party === payload.partyA ? payload.partyB : payload.partyA}
-                  </TableCell>
-                  <TableCell>{payload.tradeDetails.product.tag}</TableCell>
-                  <TableCell align="right">{formatCurrency(parseFloat(payload.tradeDetails.notional))}</TableCell>
-                  <TableCell align="right">
-                    <PnlComponent value={parseFloat(payload.markToMarket.value)} />
-                  </TableCell>
-                  <TableCell>{payload.tradeDetails.maturityDate}</TableCell>
-                </TableRow>
+      <div style={styles.section}>
+        <h2 style={styles.sectionTitle}>Outstanding Variation Margin Calls</h2>
+        {myOutstandingVmCalls.length > 0 ? (
+          <table style={styles.table}>
+            <thead>
+              <tr>
+                <th style={styles.th}>Call ID</th>
+                <th style={styles.th}>Role</th>
+                <th style={styles.th}>Amount</th>
+                <th style={styles.th}>Due Date</th>
+                <th style={styles.th}>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {myOutstandingVmCalls.map(({ contractId, payload }) => (
+                <tr key={contractId}>
+                  <td style={styles.td}>{payload.callId.slice(0, 8)}...</td>
+                  <td style={styles.td}>{payload.payer === party ? 'Payer' : 'Receiver'}</td>
+                  <td style={styles.td}>{formatCurrency(payload.amount)}</td>
+                  <td style={styles.td}>{new Date(payload.dueDate).toLocaleDateString()}</td>
+                  <td style={styles.td}>
+                    {payload.payer === party && (
+                      <button style={styles.button} onClick={() => handleSettleVmCall(contractId)}>Settle</button>
+                    )}
+                  </td>
+                </tr>
               ))}
-            </TableBody>
-          </Table>
-        </Paper>
-      )}
+            </tbody>
+          </table>
+        ) : (
+          <p style={styles.noData}>No outstanding variation margin calls.</p>
+        )}
+      </div>
+
+      <div style={styles.section}>
+        <h2 style={styles.sectionTitle}>Active Trades</h2>
+        {myTrades.length > 0 ? (
+          <table style={styles.table}>
+            <thead>
+              <tr>
+                <th style={styles.th}>Trade ID</th>
+                <th style={styles.th}>Counterparty</th>
+                <th style={styles.th}>Notional</th>
+                <th style={styles.th}>Product</th>
+                <th style={styles.th}>Maturity</th>
+                <th style={styles.th}>Latest MTM</th>
+              </tr>
+            </thead>
+            <tbody>
+              {myTrades.map(({ contractId, payload }) => (
+                <tr key={contractId}>
+                  <td style={styles.td}>{payload.tradeId.slice(0, 8)}...</td>
+                  <td style={styles.td}>{payload.partyA === party ? payload.partyB : payload.partyA}</td>
+                  <td style={styles.td}>{formatCurrency(payload.tradeDetails.notional)}</td>
+                  <td style={styles.td}>{payload.tradeDetails.productType}</td>
+                  <td style={styles.td}>{new Date(payload.tradeDetails.maturityDate).toLocaleDateString()}</td>
+                  <td style={styles.td}>{formatCurrency(getLatestValuation(payload.tradeId))}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <p style={styles.noData}>You have no active cleared trades.</p>
+        )}
+      </div>
     </div>
   );
 };
-
-export default MarginDashboard;
