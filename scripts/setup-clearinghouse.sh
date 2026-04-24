@@ -1,147 +1,148 @@
 #!/bin/bash
-
-# ==============================================================================
-# Setup Script for Canton Derivatives Clearing
 #
 # Description:
-#   This script initialises the necessary parties for the derivatives
-#   clearing application on a local Canton sandbox ledger.
+#   Allocates the central Clearinghouse party on the Canton sandbox ledger
+#   and creates its associated ClearinghouseRole contract. This script is
+#   idempotent and can be run multiple times safely.
 #
-#   It performs the following actions:
-#   1. Waits for the sandbox's JSON API to be available.
-#   2. Allocates parties for the Clearinghouse, Alice, and Bob.
-#   3. Writes the resulting party identifiers to a JSON file (`ui/parties.json`)
-#      for use by UI components and other scripts.
+#   The script performs the following actions:
+#   1. Checks if a party with the display name "Clearinghouse" already exists.
+#   2. If not, it allocates a new party using the JSON API.
+#   3. Generates a JWT for the Clearinghouse party.
+#   4. Checks if a ClearinghouseRole contract for this party already exists.
+#   5. If not, it creates one using the JSON API.
+#   6. Writes the party ID and JWT to a `.env` file for use by other scripts
+#      and the frontend application.
 #
 # Usage:
 #   ./scripts/setup-clearinghouse.sh
 #
-# Prerequisites:
-#   - `curl` and `jq` must be installed and available in the PATH.
-#   - A Canton sandbox must be running or starting up (e.g., via `dpm sandbox`).
-#
-# ==============================================================================
 
-# --- Strict Mode ---
-# Exit on error, if a variable is not set, or if a command in a pipeline fails.
 set -euo pipefail
 
 # --- Configuration ---
-readonly LEDGER_HOST="localhost"
-readonly LEDGER_PORT_JSON="7575"
-readonly JSON_API_V2_URL="http://${LEDGER_HOST}:${LEDGER_PORT_JSON}/v2"
-readonly JSON_API_V1_HEALTH_URL="http://${LEDGER_HOST}:${LEDGER_PORT_JSON}/v1/health"
-
-readonly PARTIES_OUTPUT_FILE="ui/parties.json"
-readonly MAX_RETRIES=20
-readonly RETRY_DELAY_SECS=3
+JSON_API_URL="http://localhost:7575"
+LEDGER_ID="sandbox" # Default for `dpm sandbox`
+APP_ID="canton-derivatives-clearing"
+PARTY_DISPLAY_NAME="Clearinghouse"
+PARTY_ID_HINT="Clearinghouse"
+# This assumes a role contract exists with this template ID in your Daml models.
+# e.g., in Clearing/Role.daml: `template ClearinghouseRole with clearinghouse: Party where signatory clearinghouse`
+ROLE_TEMPLATE_ID="Clearing.Role:ClearinghouseRole"
+ENV_FILE="clearinghouse.env"
 
 # --- Helper Functions ---
-
-# Log a message with a UTC timestamp
-log() {
-  echo ">>> [$(date -u +"%Y-%m-%dT%H:%M:%SZ")] ${1}"
-}
-
-# Check for required command-line tools
-check_dependencies() {
-  log "Checking for required tools (curl, jq)..."
-  for cmd in curl jq; do
-    if ! command -v "$cmd" &> /dev/null; then
-      log "ERROR: Required command '$cmd' is not installed or not in PATH."
-      log "Please install it to continue."
-      exit 1
+function check_deps() {
+  local missing=0
+  for dep in curl jq; do
+    if ! command -v "$dep" &> /dev/null; then
+      echo "ERROR: Required command '$dep' is not installed."
+      missing=1
     fi
   done
-  log "All required tools are available."
-}
-
-# Wait for the Canton Sandbox JSON API to become healthy
-wait_for_sandbox() {
-  log "Waiting for Canton sandbox to be healthy at ${JSON_API_V1_HEALTH_URL}..."
-  local retries=0
-  while ! curl --fail --silent "${JSON_API_V1_HEALTH_URL}" > /dev/null; do
-    retries=$((retries + 1))
-    if [ ${retries} -ge ${MAX_RETRIES} ]; then
-      log "ERROR: Canton sandbox did not become available after ${MAX_RETRIES} attempts."
-      log "Please ensure the sandbox is running with 'dpm sandbox'."
-      exit 1
-    fi
-    log "Sandbox not ready. Retrying in ${RETRY_DELAY_SECS}s... (Attempt ${retries}/${MAX_RETRIES})"
-    sleep "${RETRY_DELAY_SECS}"
-  done
-  log "Canton sandbox is healthy and ready for connections."
-}
-
-# Allocate a new party on the ledger via the JSON API v2 endpoint.
-# On a local sandbox, this endpoint does not require authentication.
-#
-# $1: Display Name for the party
-# $2: Party ID Hint (used to construct a deterministic party ID on some ledgers)
-# Returns: The allocated party identifier string to standard output.
-allocate_party() {
-  local display_name="$1"
-  local party_hint="$2"
-
-  log "Allocating party: '${display_name}' (hint: '${party_hint}')..."
-
-  local payload
-  payload=$(jq -n --arg dn "$display_name" --arg ph "$party_hint" \
-    '{ "displayName": $dn, "partyIdHint": $ph }')
-
-  local response
-  response=$(curl --silent --show-error --fail -X POST \
-    -H "Content-Type: application/json" \
-    -d "${payload}" \
-    "${JSON_API_V2_URL}/parties/allocate")
-
-  local party_id
-  party_id=$(echo "${response}" | jq -r '.identifier')
-
-  if [[ -z "${party_id}" || "${party_id}" == "null" ]]; then
-    log "ERROR: Failed to allocate party '${display_name}'."
-    log "Response from server: ${response}"
+  if [ "$missing" -eq 1 ]; then
+    echo "Please install the missing dependencies and try again."
     exit 1
   fi
-
-  log "Successfully allocated '${display_name}' with party ID: ${party_id}"
-  echo "${party_id}"
 }
 
-# --- Main Execution ---
-main() {
-  check_dependencies
-  wait_for_sandbox
+# --- Main Script ---
+check_deps
 
-  log "Allocating all required parties for the application..."
-  local clearinghouse_party_id
-  local alice_party_id
-  local bob_party_id
+echo "▶️  Setting up Clearinghouse party on ledger at $JSON_API_URL..."
 
-  clearinghouse_party_id=$(allocate_party "Clearinghouse" "clearinghouse")
-  alice_party_id=$(allocate_party "Alice" "alice")
-  bob_party_id=$(allocate_party "Bob" "bob")
+# 1. Find or allocate the Clearinghouse party
+echo "🔎 Checking for existing '$PARTY_DISPLAY_NAME' party..."
+ALL_PARTIES_JSON=$(curl -s -X GET "$JSON_API_URL/v1/parties")
+PARTY_ID=$(echo "$ALL_PARTIES_JSON" | jq -r ".result[] | select(.displayName == \"$PARTY_DISPLAY_NAME\") | .identifier")
 
-  # Create the output directory for the UI if it doesn't exist
-  mkdir -p "$(dirname "${PARTIES_OUTPUT_FILE}")"
+if [[ -z "$PARTY_ID" ]]; then
+  echo "🟡 Party not found. Allocating a new party..."
+  ALLOCATE_RESPONSE=$(curl -s -X POST "$JSON_API_URL/v2/parties/allocate" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"identifier_hint\": \"$PARTY_ID_HINT\",
+      \"display_name\": \"$PARTY_DISPLAY_NAME\"
+    }")
 
-  log "Writing party identifiers to ${PARTIES_OUTPUT_FILE}..."
-  jq -n \
-    --arg chid "${clearinghouse_party_id}" \
-    --arg aid "${alice_party_id}" \
-    --arg bid "${bob_party_id}" \
-    '{
-      "clearinghouse": $chid,
-      "alice": $aid,
-      "bob": $bid
-    }' > "${PARTIES_OUTPUT_FILE}"
+  PARTY_ID=$(echo "$ALLOCATE_RESPONSE" | jq -r ".party_details.identifier")
 
-  log "Setup complete. Party identifiers saved."
-  echo
-  log "Contents of ${PARTIES_OUTPUT_FILE}:"
-  cat "${PARTIES_OUTPUT_FILE}"
-  echo
-}
+  if [[ -z "$PARTY_ID" || "$PARTY_ID" == "null" ]]; then
+    echo "❌ ERROR: Failed to allocate party. Response:"
+    echo "$ALLOCATE_RESPONSE"
+    exit 1
+  fi
+  echo "✅ Party '$PARTY_DISPLAY_NAME' allocated with ID: $PARTY_ID"
+else
+  echo "✅ Found existing party with ID: $PARTY_ID"
+fi
 
-# Run the main function of the script
-main
+# 2. Generate a JWT for the party
+# For Canton sandbox, a simple base64-encoded payload is sufficient.
+HEADER='{"alg": "HS256", "typ": "JWT"}'
+PAYLOAD="{\"ledgerId\": \"$LEDGER_ID\", \"applicationId\": \"$APP_ID\", \"actAs\": [\"$PARTY_ID\"]}"
+
+# Use a portable way to base64 encode for both Linux and macOS
+if command -v "base64" &>/dev/null && [[ "$(uname)" == "Linux" ]]; then
+  # Linux `base64` uses -w 0 to disable line wrapping
+  HEADER_B64=$(echo -n "$HEADER" | base64 -w 0)
+  PAYLOAD_B64=$(echo -n "$PAYLOAD" | base64 -w 0)
+elif command -v "openssl" &>/dev/null; then
+  # macOS `base64` doesn't have -w 0, but `openssl` is a reliable fallback
+  HEADER_B64=$(echo -n "$HEADER" | openssl base64 -e -A)
+  PAYLOAD_B64=$(echo -n "$PAYLOAD" | openssl base64 -e -A)
+else
+  echo "❌ ERROR: Could not find a base64 encoder ('base64 -w 0' or 'openssl')."
+  exit 1
+fi
+
+JWT="$HEADER_B64.$PAYLOAD_B64."
+echo "🔑 Generated JWT for party."
+
+# 3. Create the ClearinghouseRole contract if it doesn't exist
+echo "🔎 Checking for existing '$ROLE_TEMPLATE_ID' contract..."
+
+QUERY_RESPONSE=$(curl -s -X POST "$JSON_API_URL/v1/query" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d "{\"templateIds\": [\"$ROLE_TEMPLATE_ID\"]}")
+
+EXISTING_CONTRACTS=$(echo "$QUERY_RESPONSE" | jq -r '.result | length')
+
+if [[ "$EXISTING_CONTRACTS" -eq 0 ]]; then
+  echo "🟡 Role contract not found. Creating one..."
+  CREATE_RESPONSE=$(curl -s -w '%{http_code}' -o /dev/null -X POST "$JSON_API_URL/v1/create" \
+    -H "Authorization: Bearer $JWT" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"templateId\": \"$ROLE_TEMPLATE_ID\",
+      \"payload\": {
+        \"clearinghouse\": \"$PARTY_ID\"
+      }
+    }")
+
+  if [[ "$CREATE_RESPONSE" != "200" ]]; then
+      echo "❌ ERROR: Failed to create ClearinghouseRole contract. HTTP Status: $CREATE_RESPONSE"
+      exit 1
+  fi
+  echo "✅ Role contract created successfully."
+else
+  echo "✅ Role contract already exists."
+fi
+
+# 4. Write credentials to .env file
+echo "💾 Writing credentials to '$ENV_FILE'..."
+cat > "$ENV_FILE" << EOL
+# Credentials for the Clearinghouse party on the local Canton sandbox
+# Generated by scripts/setup-clearinghouse.sh on $(date)
+
+# The unique identifier for the Clearinghouse party
+export CLEARINGHOUSE_PARTY_ID="$PARTY_ID"
+
+# A JSON Web Token (JWT) that grants access to act as the Clearinghouse party
+export CLEARINGHOUSE_JWT="$JWT"
+EOL
+
+echo ""
+echo "🎉 Setup complete! You can now use '$ENV_FILE' to configure your application."
+echo "   Run 'source $ENV_FILE' to load the variables into your shell."
