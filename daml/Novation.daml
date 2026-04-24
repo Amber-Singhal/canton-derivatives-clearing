@@ -3,109 +3,160 @@
 
 module Novation where
 
-import DA.Set (Set)
-import qualified DA.Set as Set
-import DA.Assert ((assertMsg))
+import Daml.Script
+import DA.Set (fromList, member)
+import Trade (ClearedTrade(..))
 
-import TradeAgreement (TradeAgreement(..), TradeStatus(..))
-
--- | Represents the proposal to novate a trade, transferring the rights and obligations of
--- | one counterparty to a new, third party.
--- | The process requires approval from all involved parties (exiting, remaining, incoming)
--- | and final execution by the clearinghouse.
+-- | Proposal to novate a cleared derivative trade. Novation is the process of
+-- | replacing one of the original counterparties (`transferor`) with a new
+-- | third party (`transferee`). This requires the consent of all three parties:
+-- | the one leaving, the one remaining, and the one entering.
+-- | This template represents the first step, where the `transferor` proposes
+-- | the novation to the other two parties.
 template NovationProposal
   with
-    proposer         : Party
-      -- ^ The party initiating the novation request. Must be one of the original counterparties.
-    exitingParty     : Party
-      -- ^ The counterparty that is leaving the trade.
-    remainingParty   : Party
-      -- ^ The counterparty that is staying in the trade.
-    incomingParty    : Party
-      -- ^ The new counterparty that will take over the exiting party's position.
-    clearinghouse    : Party
-      -- ^ The central clearing party overseeing the trade and novation.
-    tradeAgreementCid: ContractId TradeAgreement
-      -- ^ The contract ID of the original trade agreement to be novated.
-    tradeAgreement   : TradeAgreement
-      -- ^ The data of the original trade agreement for reference.
-    novationId       : Text
-      -- ^ A unique identifier for this novation process.
-    approvers        : Set Party
-      -- ^ The set of parties who have approved this novation proposal.
+    transferor      : Party
+      -- ^ The party exiting the trade.
+    remainingParty  : Party
+      -- ^ The original counterparty who will remain in the trade.
+    transferee      : Party
+      -- ^ The new party who will take over the transferor's position.
+    clearedTradeCid : ContractId ClearedTrade
+      -- ^ The `ContractId` of the trade to be novated.
   where
-    signatory proposer, clearinghouse
-
-    observer remainingParty, exitingParty, incomingParty
-
-    key (clearinghouse, novationId) : (Party, Text)
-    maintainer key._1
+    signatory transferor
+    observer remainingParty, transferee
 
     ensure
-      let parties = [exitingParty, remainingParty, incomingParty, clearinghouse]
-      proposer `elem` [exitingParty, remainingParty] &&
-      exitingParty /= remainingParty &&
-      incomingParty `notElem` [exitingParty, remainingParty] &&
-      -- Ensure no duplicate parties are specified
-      Set.size (Set.fromList parties) == length parties
+      let parties = fromList [transferor, remainingParty, transferee]
+      in length parties == 3 -- Ensures all three parties are distinct.
 
-    -- | Allows the proposer to cancel the novation request before it is fully approved and executed.
-    choice WithdrawProposal : ()
-      controller proposer
+    -- | The `remainingParty` or `transferee` can reject the proposal, which archives it.
+    choice Reject : ()
+      controller remainingParty, transferee
+      do return ()
+
+    -- | The `transferor` (proposer) can withdraw the proposal.
+    choice Withdraw : ()
+      controller transferor
+      do return ()
+
+    -- | The `remainingParty` accepts the novation proposal. This creates a
+    -- | `PartiallyAgreedNovation` contract, pending final approval from the `transferee`.
+    choice AcceptByRemainingParty : ContractId PartiallyAgreedNovation
+      controller remainingParty
       do
-        archive self
+        create PartiallyAgreedNovation with ..
 
-    -- | Allows one of the required parties (exiting, remaining, or incoming) to approve the novation.
-    choice AddApproval : ContractId NovationProposal
-      controller approver
+-- | Represents a novation agreement that has been accepted by the original
+-- | counterparties (`transferor` and `remainingParty`), but is still awaiting
+-- | final consent from the incoming `transferee`.
+template PartiallyAgreedNovation
+  with
+    transferor      : Party
+    remainingParty  : Party
+    transferee      : Party
+    clearedTradeCid : ContractId ClearedTrade
+  where
+    signatory transferor, remainingParty
+    observer transferee
+
+    -- | Either of the original parties can withdraw their consent before the
+    -- | `transferee` has given final approval.
+    choice Withdraw : ()
+      controller transferor, remainingParty
+      do return ()
+
+    -- | The `transferee` provides the final consent, which triggers the atomic
+    -- | novation of the underlying trade contract.
+    choice AcceptByTransferee : ContractId ClearedTrade
+      controller transferee
       do
-        assertMsg
-          ("Controller must be one of the required approving parties: " <> show [exitingParty, remainingParty, incomingParty])
-          (approver `elem` [exitingParty, remainingParty, incomingParty])
-        assertMsg
-          ("Party " <> show approver <> " has already approved this novation.")
-          (approver `notElem` approvers)
+        -- Fetch the original trade to ensure it's still active and to verify parties.
+        trade <- fetch clearedTradeCid
 
-        create this with approvers = Set.insert approver approvers
+        -- Assert that the parties on this agreement match the parties on the trade.
+        let tradeParties = fromList [trade.party1, trade.party2]
+        assertMsg "Transferor is not a party to the original trade." $
+          member transferor tradeParties
+        assertMsg "Remaining party is not a party to the original trade." $
+          member remainingParty tradeParties
+        assertMsg "Transferor and remaining party must be the two distinct parties of the trade." $
+          transferor /= remainingParty
 
-    -- | The clearinghouse executes the novation once all required parties have given their approval.
-    -- | This atomically archives the old trade agreement and creates a new one between the remaining
-    -- | and incoming counterparties.
-    choice ExecuteNovation : ContractId TradeAgreement
-      controller clearinghouse
-      do
-        let requiredApprovers = Set.fromList [exitingParty, remainingParty, incomingParty]
-        assertMsg
-          ("Novation cannot be executed until all parties have approved. Required: "
-          <> show requiredApprovers <> ", Actual: " <> show approvers)
-          (approvers == requiredApprovers)
+        -- Atomically exercise the `Novate` choice on the `ClearedTrade` contract.
+        -- This archives the old trade and creates a new one with the transferee
+        -- in a single transaction, ensuring a seamless and risk-free handover.
+        exercise clearedTradeCid Novate with
+          newCounterparty = transferee
 
-        -- 1. Archive the original trade agreement. It is being replaced by the new one.
-        --    This assumes the TradeAgreement template has an `Archive` choice controlled by the
-        --    clearinghouse.
-        exercise tradeAgreementCid TradeAgreement.Archive with archiver = clearinghouse
 
-        -- 2. Determine the party roles for the new trade agreement. The incoming party
-        --    takes the place of the exiting party.
-        let
-          (newPartyA, newPartyB) =
-            if tradeAgreement.partyA == exitingParty
-              then (incomingParty, remainingParty)
-              else (remainingParty, incomingParty)
+-- | Test setup and script for the novation workflow.
+module Novation.Test where
 
-        -- 3. Create the new trade agreement with the updated counterparties.
-        newTradeCid <- create TradeAgreement with
-          partyA = newPartyA
-          partyB = newPartyB
-          clearinghouse = clearinghouse
-          tradeId = tradeAgreement.tradeId -- Keep the same trade ID for traceability
-          tradeDetails = tradeAgreement.tradeDetails
-          initialMarginRequirement = tradeAgreement.initialMarginRequirement
-          status = Active
-          -- A new trade ID could also be generated if business logic requires it,
-          -- e.g., tradeId = tradeAgreement.tradeId <> "-NOV-1"
+import Daml.Script
+import Novation
+import Trade (ClearedTrade(..))
+import DA.Date as D
+import DA.Time
 
-        -- 4. Archive this proposal as it has been successfully processed.
-        archive self
+-- | This script demonstrates the full novation lifecycle.
+-- | 1. A trade is created between Party1 and Party2.
+-- | 2. Party1 proposes to novate its side of the trade to Party3.
+-- | 3. Party2 accepts the proposal.
+-- | 4. Party3 gives the final acceptance, completing the novation.
+novation_workflow_test : Script ()
+novation_workflow_test = script do
+  p1 <- allocatePartyWithHint "Party1" (PartyIdHint "Party1")
+  p2 <- allocatePartyWithHint "Party2" (PartyIdHint "Party2")
+  p3 <- allocatePartyWithHint "Party3" (PartyIdHint "Party3")
+  clearingHouse <- allocatePartyWithHint "ClearingHouse" (PartyIdHint "ClearingHouse")
 
-        return newTradeCid
+  -- Step 1: Create an initial trade between Party1 and Party2
+  now <- getTime
+  let tradeData = object (
+        "id" :="ISDA-2024-9876",
+        "notional" := "10000000.0",
+        "currency" := "USD",
+        "product" := "InterestRateSwap",
+        "effectiveDate" := D.toDateUTC now,
+        "maturityDate" := D.toDateUTC (addRelTime now (days 365))
+      )
+  tradeCid <- submit p1 do
+    createCmd ClearedTrade with
+      party1 = p1
+      party2 = p2
+      clearingHouse
+      tradeData
+      marginData = object ("initial" := "500000.0", "variation" := "0.0")
+
+  -- Step 2: Party1 (transferor) proposes to novate to Party3 (transferee)
+  proposalCid <- submit p1 do
+    createCmd NovationProposal with
+      transferor = p1
+      remainingParty = p2
+      transferee = p3
+      clearedTradeCid = tradeCid
+
+  -- Step 3: Party2 (remainingParty) accepts the proposal
+  agreedCid <- submit p2 do
+    exerciseCmd proposalCid AcceptByRemainingParty
+
+  -- Step 4: Party3 (transferee) gives final acceptance, executing the novation
+  newTradeCid <- submit p3 do
+    exerciseCmd agreedCid AcceptByTransferee
+
+  -- Verification: Check that the new trade has the correct parties (Party2 and Party3)
+  newTrade <- fetch newTradeCid
+  let newTradeParties = fromList [newTrade.party1, newTrade.party2]
+
+  assertMsg "Party2 should be in the new trade" $ member p2 newTradeParties
+  assertMsg "Party3 should be in the new trade" $ member p3 newTradeParties
+  assertMsg "Party1 should NOT be in the new trade" $ not (member p1 newTradeParties)
+
+  -- Verification: Check that the old trade contract has been archived
+  let maybeOldTrade = queryContractId p1 tradeCid
+  assert (maybeOldTrade == None)
+
+  debug "Novation workflow test completed successfully."
+  return ()
