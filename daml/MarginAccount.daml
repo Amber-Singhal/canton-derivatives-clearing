@@ -1,82 +1,184 @@
--- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
--- SPDX-License-Identifier: Apache-2.0
+module Clearing.MarginAccount where
 
-module MarginAccount where
+import Daml.Finance.Interface.Asset.Fungible (Holding)
+import Daml.Finance.Interface.Asset.Fungible qualified as Fungible
+import Daml.Finance.Asset.Fungible qualified as FungibleAsset
+import Daml.Finance.Interface.Asset.Base qualified as Base
+import Daml.Finance.Interface.Types.Common.Types (InstrumentKey)
+import DA.Set (Set)
+import DA.Next.Map (Map)
 
-import DA.Assert ((assertMsg))
-import TradeAgreement (TradeAgreement)
 
--- | Represents a margin account for a specific bilateral trade, managed by a
--- | central clearinghouse. This contract holds the initial margin from both
--- | parties and tracks the daily variation margin adjustments.
--- | The lifecycle of this contract is tied to the underlying `TradeAgreement`.
--- | It is created when the trade is cleared and archived when the trade is settled.
+-- | Represents a pledge of a fungible asset holding as collateral.
+-- The pledgor (clearing member) grants the pledgee (clearinghouse) the right to
+-- seize the collateral under specific conditions (e.g., a default event), which
+-- are enforced by higher-level contracts like `MarginAccount` that use this pledge.
+template CollateralPledge
+  with
+    pledgor: Party
+      -- ^ The party pledging the asset (e.g., a clearing member).
+    pledgee: Party
+      -- ^ The party to whom the asset is pledged (e.g., a clearinghouse).
+    holdingCid: ContractId Fungible.Holding
+      -- ^ The holding contract of the pledged asset.
+  where
+    signatory pledgor, pledgee
+
+    key (pledgor, pledgee, holdingCid) : (Party, Party, ContractId Fungible.Holding)
+    maintainer key._1
+
+    -- | The pledgee exercises their right to seize the collateral.
+    -- This consumes the pledge and the original holding, and creates a new holding
+    -- owned by the pledgee. This choice requires the authority of both parties,
+    -- which is granted by them being signatories on this contract.
+    choice Seize : ContractId Fungible.Holding
+      controller pledgee
+      do
+        holdingView <- view holdingCid
+        holding <- fetch holdingCid
+
+        -- This action is consuming on the underlying holding.
+        -- We archive the original holding and create a new one for the pledgee.
+        archive holdingCid
+
+        -- Create a new holding owned by the pledgee using the concrete
+        -- implementation from the daml-finance reference library.
+        fmap toInterface @FungibleAsset.Holding $ create FungibleAsset.Holding with
+          instrument = holdingView.instrument
+          amount = holdingView.amount
+          account = Base.Account with
+            owner = pledgee
+            custodian = holdingView.account.custodian
+            id = "SEIZED-" <> holdingView.account.id
+          observers = Map.empty
+
+-- | Represents a margin account held with a clearinghouse.
+-- This account tracks margin requirements and the collateral pledged against them.
+-- It is controlled by the clearinghouse, while the owner (clearing member) can
+-- interact with it to deposit or withdraw excess margin.
 template MarginAccount
   with
-    clearinghouse   : Party
-      -- ^ The central counterparty (CCP) managing the account.
-    partyA          : Party
-      -- ^ The first counterparty of the trade.
-    partyB          : Party
-      -- ^ The second counterparty of the trade.
-    tradeAgreementCid : ContractId TradeAgreement
-      -- ^ The underlying trade agreement this margin account collateralizes.
-    initialMarginA  : Decimal
-      -- ^ The initial margin posted by Party A. Must be non-negative.
-    initialMarginB  : Decimal
-      -- ^ The initial margin posted by Party B. Must be non-negative.
-    variationMarginA: Decimal
-      -- ^ The cumulative variation margin for Party A based on daily Mark-to-Market (MTM) changes.
-      -- | This value represents the net profit or loss for Party A since inception.
-      -- | A positive value means Party B owes Party A. A negative value means Party A owes Party B.
-      -- | The variation margin for Party B is always the negation of this value.
-    currency        : Text
-      -- ^ The currency of all margin amounts (e.g., "USD").
+    clearinghouse : Party
+      -- ^ The central counterparty (CCP) that manages the account.
+    owner : Party
+      -- ^ The clearing member who owns the margin in this account.
+    accountId : Text
+      -- ^ A unique identifier for this margin account.
+    collateralType : InstrumentKey
+      -- ^ The instrument key identifying the type of asset used as margin.
+    initialMarginRequirement : Decimal
+      -- ^ The required amount of initial margin.
+    variationMarginRequirement : Decimal
+      -- ^ The required amount of variation margin. Can be positive or negative.
+    pledgeCid : ContractId CollateralPledge
+      -- ^ A reference to the pledge contract for the collateral.
+    observers : Set Party
+      -- ^ Additional observers of the account state.
   where
     signatory clearinghouse
-    observer partyA, partyB
+    observer owner, observers
 
-    key (clearinghouse, tradeAgreementCid) : (Party, ContractId TradeAgreement)
+    key (clearinghouse, owner, accountId) : (Party, Party, Text)
     maintainer key._1
 
     ensure
-      initialMarginA >= 0.0 && initialMarginB >= 0.0
+      initialMarginRequirement >= 0.0
 
-    -- | Calculates the net variation margin for Party B. It is always the
-    -- | inverse of Party A's variation margin, reflecting the zero-sum nature
-    -- | of the derivative's PnL.
-    let variationMarginB = -variationMarginA
+    -- | Helper function to calculate the total margin requirement.
+    let totalMarginRequirement = initialMarginRequirement + variationMarginRequirement
 
-    -- | The clearinghouse can update the variation margin based on the daily
-    -- | Mark-to-Market (MTM) calculation for the underlying trade.
-    choice UpdateVariationMargin : ContractId MarginAccount
+    -- | A clearing member deposits additional collateral. This involves providing a new
+    -- holding, which is then merged with the existing pledged collateral. A new pledge
+    -- is created for the combined holding.
+    choice DepositMargin : ContractId MarginAccount
       with
-        -- | The new cumulative PnL for Party A since the trade inception.
-        -- | This value replaces the old `variationMarginA`.
-        newCumulativePnlA : Decimal
-      controller clearinghouse
+        depositHoldingCid : ContractId Fungible.Holding
+          -- ^ The holding contract representing the funds to be deposited.
+      controller owner
       do
-        -- This choice updates the total VM balance on-ledger. In a full implementation,
-        -- the daily cash settlement of the margin call (the difference between
-        -- yesterday's and today's VM) would be handled by a separate process,
-        -- likely involving fungible token transfers.
-        create this with
-          variationMarginA = newCumulativePnlA
+        -- Fetch all relevant contracts and their views.
+        pledge <- fetch pledgeCid
+        existingHolding <- fetch pledge.holdingCid
+        depositHoldingView <- view depositHoldingCid
 
-    -- | The clearinghouse can close the margin account once the underlying trade
-    -- | has been terminated or has expired. This would typically follow the final
-    -- | settlement of the trade.
-    choice CloseAccount : ()
+        -- Validations
+        assertMsg "Deposited collateral must match the account's collateral type"
+          (depositHoldingView.instrument == collateralType)
+        assertMsg "Depositor must be the account owner"
+          (depositHoldingView.account.owner == owner)
+        assertMsg "Pledge must be for the correct owner/clearinghouse"
+          (pledge.pledgor == owner && pledge.pledgee == clearinghouse)
+
+        -- Merge the deposited holding into the main pledged holding.
+        (mergedHoldingCid, _) <- exercise existingHolding Fungible.Merge with
+          otherCids = [depositHoldingCid]
+
+        -- Archive the old pledge and create a new one for the merged holding.
+        archive pledgeCid
+        newPledgeCid <- create CollateralPledge with
+          pledgor = owner
+          pledgee = clearinghouse
+          holdingCid = mergedHoldingCid
+
+        -- Recreate the MarginAccount pointing to the new pledge.
+        create this with pledgeCid = newPledgeCid
+
+    -- | A clearing member withdraws excess collateral from their margin account.
+    -- The withdrawal is only permitted if the remaining balance is sufficient to cover
+    -- the total margin requirement.
+    choice WithdrawExcessMargin : ContractId Fungible.Holding
+      with
+        amountToWithdraw : Decimal
+          -- ^ The amount of collateral to withdraw.
+      controller owner
+      do
+        -- Fetch all relevant contracts and their views.
+        pledge <- fetch pledgeCid
+        pledgedHoldingView <- view pledge.holdingCid
+        let currentBalance = pledgedHoldingView.amount
+
+        -- Calculate excess margin and validate withdrawal amount.
+        let excessMargin = currentBalance - totalMarginRequirement
+        assertMsg ("Withdrawal amount " <> show amountToWithdraw <> " exceeds available excess margin " <> show excessMargin)
+          (amountToWithdraw > 0.0 && amountToWithdraw <= excessMargin)
+
+        -- Split the pledged holding.
+        (remainingHoldingCid, withdrawnHoldingCid) <- exercise pledge.holdingCid Fungible.Split by
+          amounts = [amountToWithdraw]
+
+        -- Archive the old pledge and create a new one for the remaining holding.
+        archive pledgeCid
+        newPledgeCid <- create CollateralPledge with
+          pledgor = owner
+          pledgee = clearinghouse
+          holdingCid = remainingHoldingCid
+
+        -- Recreate the MarginAccount pointing to the new pledge.
+        create this with pledgeCid = newPledgeCid
+
+        -- Return the CID of the withdrawn funds to the owner.
+        return withdrawnHoldingCid
+
+    -- | The clearinghouse updates the margin requirements based on MTM calculations and risk models.
+    choice UpdateMarginRequirement : ContractId MarginAccount
+      with
+        newInitialMargin : Decimal
+          -- ^ The new initial margin requirement.
+        newVariationMargin : Decimal
+          -- ^ The new variation margin requirement.
       controller clearinghouse
       do
-        -- In a production system, this choice would be more complex. It would:
-        -- 1. Fetch the TradeAgreement contract to verify its status is 'Settled' or 'Terminated'.
-        --    (e.g., `tradeData <- fetch tradeAgreementCid; assert (tradeData.isSettled)`)
-        -- 2. Calculate the final settlement amounts for each party:
-        --    - partyAReturn = initialMarginA + variationMarginA
-        --    - partyBReturn = initialMarginB + variationMarginB
-        -- 3. Trigger choices on fungible token contracts (e.g., a stablecoin)
-        --    to transfer these settlement amounts back to the respective parties.
-        -- 4. Only upon successful settlement would this MarginAccount be archived.
-        -- For simplicity in this example, we just archive the contract.
-        pure ()
+        create this with
+          initialMarginRequirement = newInitialMargin
+          variationMarginRequirement = newVariationMargin
+
+    -- | In a default event, the clearinghouse seizes the collateral.
+    -- This consumes the `MarginAccount` and invokes the `Seize` choice on the
+    -- `CollateralPledge` contract, transferring the collateral to the clearinghouse.
+    choice SeizeCollateral : ContractId Fungible.Holding
+      controller clearinghouse
+      do
+        -- Exercise the consuming Seize choice on the pledge contract. This transfers the
+        -- underlying holding to the clearinghouse and archives the pledge.
+        -- The MarginAccount is also consumed as it is not recreated.
+        exercise pledgeCid Seize
