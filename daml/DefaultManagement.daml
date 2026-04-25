@@ -1,197 +1,260 @@
--- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- |
+-- Copyright (c) 2024, Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 -- SPDX-License-Identifier: Apache-2.0
+--
 
-module Clearing.DefaultManagement where
+module DefaultManagement where
 
-import DA.List (maxOn)
-import DA.Map (Map)
-import qualified DA.Map as Map
-import DA.Optional (fromSome, Optional(..))
-import DA.Text (Text)
-import DA.Time (Time)
+import Daml.Script
 
-import Clearing.Margin (MarginAccount)
-import Clearing.Trade (ClearedTrade)
+-- This module defines the workflow for managing a clearing member's default.
+-- When a member is declared in default by the Clearing House, a structured
+-- process is initiated to close out or auction the member's portfolio,
+-- utilize their margin and default fund contributions, and allocate any
+-- remaining losses.
 
--- | Represents a formal declaration of default by the clearinghouse against a member.
--- This contract initiates the default management procedures, primarily the auctioning
--- of the defaulting member's portfolio.
-template DefaultNotice
+-- =============================================================================
+-- === Placeholders for dependent contracts ===
+-- In a complete multi-module project, these templates would be defined in
+-- separate files (e.g., Trade.daml, Margin.daml) and imported. They are
+-- included here as simplified placeholders to make this module self-contained
+-- and compilable for demonstration purposes.
+-- =============================================================================
+
+-- | Represents a cleared derivative trade.
+template Trade
   with
-    clearinghouse: Party
-      -- ^ The central counterparty declaring the default.
-    defaultingParty: Party
-      -- ^ The member party that is in default.
-    nonDefaultingParties: [Party]
-      -- ^ All other active members of the clearinghouse who may participate in the auction.
-    reason: Text
-      -- ^ The stated reason for the default declaration.
-    declarationTime: Time
-      -- ^ The timestamp of the default declaration.
+    clearingHouse : Party
+    memberA : Party
+    memberB : Party
+    details : Text
   where
-    signatory clearinghouse
-    observer defaultingParty, nonDefaultingParties
+    signatory clearingHouse, memberA, memberB
 
-    key (clearinghouse, defaultingParty) : (Party, Party)
+-- | Represents a member's margin account held at the Clearing House.
+template MarginAccount
+  with
+    clearingHouse: Party
+    member: Party
+    balance: Decimal
+  where
+    signatory clearingHouse, member
+
+    choice Use_Full_Balance : Decimal
+      controller clearingHouse
+      do return balance
+
+-- | Represents a member's contribution to the shared default fund.
+template DefaultFundContribution
+  with
+    clearingHouse: Party
+    member: Party
+    amount: Decimal
+  where
+    signatory clearingHouse, member
+
+    choice Use_Full_Contribution : Decimal
+      controller clearingHouse
+      do return amount
+
+
+-- =============================================================================
+-- === Core Default Management Logic ===
+-- =============================================================================
+
+-- | Defines the state of the portfolio auction within the default management process.
+data AuctionStatus =
+    Initiated      -- ^ Process created, auction not yet open.
+  | BiddingOpen    -- ^ Auction is open, and bids can be placed by non-defaulting members.
+  | BiddingClosed  -- ^ Bidding period has ended, awaiting portfolio award.
+  deriving (Eq, Show)
+
+-- | Represents a bid submitted by a non-defaulting member for the defaulted portfolio.
+data Bid = Bid
+  with
+    bidder : Party
+    amount : Decimal -- ^ A negative amount indicates the portfolio is a liability and the bidder requires payment to take it on.
+  deriving (Eq, Show)
+
+-- | This contract is created by the ClearingHouse when a member defaults.
+-- It orchestrates the entire resolution process, from auctioning the portfolio
+-- to applying funds to cover losses.
+template DefaultManagementProcess
+  with
+    clearingHouse : Party
+    defaultingMember : Party
+    nonDefaultingMembers : [Party]
+    defaulterPortfolioCids : [ContractId Trade]           -- ^ The list of trades to be auctioned/closed out.
+    defaulterMarginCid : ContractId MarginAccount         -- ^ The defaulter's margin to be used first.
+    defaulterDefaultFundCid : ContractId DefaultFundContribution -- ^ Defaulter's default fund contribution to be used second.
+    status : AuctionStatus
+    bids : [Bid]
+  where
+    signatory clearingHouse
+    observer nonDefaultingMembers, defaultingMember
+
+    key (clearingHouse, defaultingMember) : (Party, Party)
     maintainer key._1
 
-    -- | Choice to initiate the auction of the defaulting party's entire derivatives portfolio.
-    choice StartPortfolioAuction : ContractId PortfolioAuction
+    -- | The ClearingHouse opens the defaulter's portfolio for auction
+    -- among the non-defaulting members.
+    choice Open_Auction : ContractId DefaultManagementProcess
+      controller clearingHouse
+      do
+        assertMsg "Auction must be in 'Initiated' state to be opened." (status == Initiated)
+        create this with status = BiddingOpen
+
+    -- | A non-defaulting member submits a bid for the entire portfolio.
+    choice Place_Bid : ContractId DefaultManagementProcess
       with
-        tradeCids : [ContractId ClearedTrade]
-          -- ^ The list of all active trades held by the defaulting party.
-        auctionDeadline : Time
-          -- ^ The deadline for other members to submit bids for the portfolio.
-      controller clearinghouse
+        bidAmount : Decimal
+      controller bidder
       do
-        now <- getTime
-        assertMsg "Auction deadline must be in the future" (auctionDeadline > now)
+        assertMsg "Bidding is not currently open." (status == BiddingOpen)
+        assertMsg "Controller must be a non-defaulting member." (elem bidder nonDefaultingMembers)
+        assertMsg "The defaulting member cannot participate in the auction." (bidder /= defaultingMember)
 
-        -- Verify that all provided trades actually involve the defaulting party.
-        forA_ tradeCids \cid -> do
-          trade <- fetch cid
-          assertMsg ("Trade " <> show cid <> " does not involve the defaulting party " <> show defaultingParty)
-            (trade.party1 == defaultingParty || trade.party2 == defaultingParty)
+        -- To prevent duplicate bids, remove any existing bid from the same bidder.
+        let updatedBids = (Bid bidder bidAmount) :: (filter (\b -> b.bidder /= bidder) bids)
+        create this with bids = updatedBids
 
-        create PortfolioAuction with
-          clearinghouse
-          defaultingParty
-          bidders = nonDefaultingParties
-          tradeCids
-          bids = Map.empty
-          deadline = auctionDeadline
-
-    -- | Allows the clearinghouse to archive the notice once the default process is complete.
-    choice ArchiveDefaultNotice : ()
-      controller clearinghouse
+    -- | After a suitable bidding period, the ClearingHouse closes the auction.
+    choice Close_Auction : ContractId DefaultManagementProcess
+      controller clearingHouse
       do
-        pure ()
+        assertMsg "Auction must be open to be closed." (status == BiddingOpen)
+        create this with status = BiddingClosed
 
--- | Manages the auction of a defaulted member's portfolio of cleared trades.
--- The goal is to transfer the entire portfolio to a solvent member to minimize market disruption.
-template PortfolioAuction
+    -- | The ClearingHouse awards the portfolio to the winning bidder, calculates the
+    -- final loss, and resolves the default.
+    choice Award_Portfolio_And_Resolve : ContractId DefaultResolution
+      controller clearingHouse
+      do
+        assertMsg "Auction must be closed before awarding the portfolio." (status == BiddingClosed)
+        assertMsg "Cannot resolve auction as no bids were placed." (not $ null bids)
+
+        -- Determine the winning bid (highest value, which could be the least negative).
+        let
+          winningBid = foldl (\acc cur -> if cur.amount > acc.amount then cur else acc) (head bids) (tail bids)
+          winner = winningBid.bidder
+          winningAmount = winningBid.amount
+
+        -- Step 1: Calculate gross loss/gain from auction.
+        -- A negative winning bid means the portfolio is a liability, resulting in a loss.
+        let grossLoss = -winningAmount
+
+        -- Step 2: Use defaulter's margin to cover the loss.
+        marginUsed <- exercise defaulterMarginCid Use_Full_Balance
+        let lossAfterMargin = grossLoss - marginUsed
+
+        -- Step 3: Use defaulter's default fund contribution to cover remaining loss.
+        defaulterDFUsed <- exercise defaulterDefaultFundCid Use_Full_Contribution
+        let lossAfterDefaulterDF = lossAfterMargin - defaulterDFUsed
+
+        -- Step 4: Calculate final net loss to be socialized among other members.
+        -- If lossAfterDefaulterDF is negative, it means there was a surplus.
+        let finalNetLoss = if lossAfterDefaulterDF > 0.0 then lossAfterDefaulterDF else 0.0
+
+        -- Novate/transfer the portfolio by archiving the old trades.
+        -- In a full implementation, new trades would be created for the winner.
+        forA_ defaulterPortfolioCids archive
+
+        -- Create a final resolution contract to provide a permanent record of the outcome.
+        create DefaultResolution
+          with
+            clearingHouse
+            defaultingMember
+            nonDefaultingMembers
+            winningBidder = winner
+            winningBidAmount = winningAmount
+            finalNetLoss
+            lossCoveredByMargin = marginUsed
+            lossCoveredByDefaulterDF = defaulterDFUsed
+            allBids = bids
+
+-- | A final, archival contract that records the outcome of a default event.
+template DefaultResolution
   with
-    clearinghouse: Party
-      -- ^ The auction operator.
-    defaultingParty: Party
-      -- ^ The party whose portfolio is being auctioned.
-    bidders: [Party]
-      -- ^ The list of eligible parties who can bid on the portfolio.
-    tradeCids: [ContractId ClearedTrade]
-      -- ^ The contract IDs of the trades in the portfolio.
-    bids: Map Party Decimal
-      -- ^ A map of bids received, where the key is the bidder and the value is the bid amount.
-      -- A positive amount is a payment to the clearinghouse. A negative amount is a payment
-      -- from the clearinghouse to the winning bidder to take on the portfolio.
-    deadline: Time
-      -- ^ The time by which all bids must be submitted.
+    clearingHouse : Party
+    defaultingMember : Party
+    nonDefaultingMembers : [Party]
+    winningBidder : Party
+    winningBidAmount : Decimal
+    finalNetLoss : Decimal
+    lossCoveredByMargin : Decimal
+    lossCoveredByDefaulterDF : Decimal
+    allBids : [Bid]
   where
-    signatory clearinghouse
-    observer defaultingParty, bidders
+    signatory clearingHouse
+    observer defaultingMember, nonDefaultingMembers
 
-    key (clearinghouse, defaultingParty) : (Party, Party)
-    maintainer key._1
+-- =============================================================================
+-- === Test Script ===
+-- =============================================================================
 
-    -- | Allows an eligible bidder to place or update their bid for the entire portfolio.
-    choice PlaceBid : ContractId PortfolioAuction
-      with
-        bidAmount: Decimal
-          -- ^ The amount the bidder is willing to pay/receive for the portfolio.
-      controller bidders
-      do
-        now <- getTime
-        assertMsg "Auction has already passed its deadline" (now <= deadline)
+-- | A Daml Script to set up parties and test the default management workflow.
+defaultManagementTest : Script ()
+defaultManagementTest = script do
+  -- 1. Setup Parties and Initial State
+  ch <- allocatePartyWithHint "ClearingHouse" (PartyIdHint "clearinghouse")
+  member1 <- allocatePartyWithHint "Member1" (PartyIdHint "member1")
+  member2 <- allocatePartyWithHint "Member2" (PartyIdHint "member2")
+  member3 <- allocatePartyWithHint "Member3_Defaulter" (PartyIdHint "member3")
 
-        -- The controller of the choice is the bidder.
-        let bidder = head (signatories self)
-        assertMsg "Party is not an eligible bidder" (bidder `elem` bidders)
+  -- Create placeholder contracts representing the state before default
+  trade1Cid <- submit ch do createCmd Trade with clearingHouse = ch, memberA = member1, memberB = member3, details = "IRS USD 10M 5Y"
+  trade2Cid <- submit ch do createCmd Trade with clearingHouse = ch, memberA = member2, memberB = member3, details = "FX Fwd EUR/USD 1M"
 
-        -- Recreate the auction contract with the new or updated bid.
-        create this with bids = Map.insert bidder bidAmount bids
+  marginCid <- submitMulti [ch, member3] [] do createCmd MarginAccount with clearingHouse = ch, member = member3, balance = 100_000.0
+  dfCid <- submitMulti [ch, member3] [] do createCmd DefaultFundContribution with clearingHouse = ch, member = member3, amount = 50_000.0
 
-    -- | Closes the auction after the deadline, determines the winner, novates the trades,
-    -- and initiates margin liquidation if necessary.
-    choice CloseAuctionAndAllocate : Optional (ContractId MarginLiquidation)
-      with
-        portfolioMtmValue: Decimal
-          -- ^ The total Mark-to-Market value of the portfolio at the time of default.
-        defaultingPartyMarginAccountCid: ContractId MarginAccount
-          -- ^ The margin account of the defaulting party, to be used for loss coverage.
-      controller clearinghouse
-      do
-        now <- getTime
-        assertMsg "Cannot close auction before the deadline has passed" (now > deadline)
-        assertMsg "No bids were placed in the auction" (not $ Map.isEmpty bids)
+  -- 2. Initiate Default Management Process
+  -- The CH declares Member3 as defaulted and creates the process contract.
+  let portfolio = [trade1Cid, trade2Cid]
+  processCid <- submit ch do
+    createCmd DefaultManagementProcess with
+      clearingHouse = ch
+      defaultingMember = member3
+      nonDefaultingMembers = [member1, member2]
+      defaulterPortfolioCids = portfolio
+      defaulterMarginCid = marginCid
+      defaulterDefaultFundCid = dfCid
+      status = Initiated
+      bids = []
+  debug "Default Management process initiated."
 
-        -- The winning bid is the highest numerical value.
-        let bidList = Map.toList bids
-        let (winningBidder, winningBidAmount) = fromSome (maxOn snd bidList)
+  -- 3. Run the Auction Process
+  processCid_BiddingOpen <- submit ch do exerciseCmd processCid Open_Auction
+  debug "Auction opened for bidding."
 
-        debug $ "Portfolio auction won by " <> show winningBidder <> " with a bid of " <> show winningBidAmount
+  -- Members place bids. A negative bid means the portfolio has a negative value.
+  processCid_Bid1 <- submit member1 do exerciseCmd processCid_BiddingOpen (Place_Bid with bidAmount = -200_000.0)
+  debug "Member1 placed a bid of -200,000.0"
+  processCid_Bid2 <- submit member2 do exerciseCmd processCid_Bid1 (Place_Bid with bidAmount = -180_000.0)
+  debug "Member2 placed a bid of -180,000.0 (Member1's bid is better)"
 
-        -- Novate each trade in the portfolio to the winning bidder.
-        forA_ tradeCids \cid -> do
-          -- Assuming ClearedTrade has a choice named `Novate` which archives the old trade
-          -- and creates a new one with the new counterparty.
-          exercise cid ClearedTrade_Novate with newParty = winningBidder, oldParty = defaultingParty
+  processCid_BiddingClosed <- submit ch do exerciseCmd processCid_Bid2 Close_Auction
+  debug "Auction closed by Clearing House."
 
-        -- Settlement of the bid amount with the winner is assumed to happen off-ledger
-        -- or via a separate settlement instruction contract.
+  -- 4. Award Portfolio and Resolve
+  resolutionCid <- submit ch do exerciseCmd processCid_BiddingClosed Award_Portfolio_And_Resolve
+  debug "Portfolio awarded and default resolved."
 
-        -- Calculate the loss incurred by the clearinghouse.
-        -- Loss = (Value of portfolio) - (Amount received for portfolio)
-        let loss = portfolioMtmValue - winningBidAmount
+  -- 5. Verify the Outcome
+  resolution <- fetch resolutionCid
+  debug $ "Final Resolution: " <> show resolution
 
-        debug $ "Auction resulted in a " <> (if loss >= 0.0 then "loss" else "gain") <> " of " <> show (abs loss)
+  -- Expected Financial Outcome:
+  -- Winning Bid (highest value): -180,000.0 from Member2
+  -- Gross Loss = -(-180,000.0) = 180,000.0
+  -- Loss covered by Margin: 100,000.0
+  -- Loss covered by Defaulter's DF: 50,000.0
+  -- Total covered by defaulter: 150,000.0
+  -- Final Net Loss to be socialized = 180,000.0 - 150,000.0 = 30,000.0
+  assert (resolution.winningBidder == member2)
+  assert (resolution.winningBidAmount == -180_000.0)
+  assert (resolution.finalNetLoss == 30_000.0)
 
-        -- If there is a loss, create a MarginLiquidation contract to manage covering it.
-        if loss > 0.0 then do
-          cid <- create MarginLiquidation with
-            clearinghouse
-            defaultingParty
-            marginAccountCid = defaultingPartyMarginAccountCid
-            lossToCover = loss
-          pure (Some cid)
-        else
-          -- If there is a gain, it would typically be contributed to the clearinghouse default fund.
-          -- For this model, we simply conclude the process.
-          pure None
+  debug "Test successful: Default resolution calculation is correct."
 
--- | Manages the process of seizing and liquidating a defaulting party's margin account
--- to cover losses incurred from the portfolio auction.
-template MarginLiquidation
-  with
-    clearinghouse: Party
-      -- ^ The party managing the liquidation.
-    defaultingParty: Party
-      -- ^ The owner of the margin account being liquidated.
-    marginAccountCid: ContractId MarginAccount
-      -- ^ The contract ID of the margin account.
-    lossToCover: Decimal
-      -- ^ The total loss that needs to be covered from the margin.
-  where
-    signatory clearinghouse
-    observer defaultingParty
-
-    key (clearinghouse, defaultingParty) : (Party, Party)
-    maintainer key._1
-
-    -- | Applies the collateral from the margin account to cover the specified loss.
-    -- This is a simplified representation. A real implementation would involve choices
-    -- on the MarginAccount to transfer assets and update balances.
-    choice ApplyMargin : ()
-      controller clearinghouse
-      do
-        -- In a production implementation, this choice would fetch the margin account,
-        -- exercise a choice like 'SeizeCollateral', and handle the actual transfer of assets.
-        -- The logic would also need to account for insufficient margin and trigger a draw
-        -- on the clearinghouse's default fund.
-        marginAccount <- fetch marginAccountCid
-
-        debug $ "Applied margin from account " <> show marginAccountCid <>
-                " for defaulting party " <> show defaultingParty <>
-                " to cover loss of " <> show lossToCover <> "." <>
-                " Any shortfall must be covered by the default fund."
-
-        -- This contract is archived upon successful margin application, concluding this workflow step.
-        pure ()
+  return ()
