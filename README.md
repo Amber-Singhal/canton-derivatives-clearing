@@ -2,131 +2,138 @@
 
 [![CI](https://github.com/digital-asset/canton-derivatives-clearing/actions/workflows/ci.yml/badge.svg)](https://github.com/digital-asset/canton-derivatives-clearing/actions/workflows/ci.yml)
 
-This project provides a complete implementation of an Over-the-Counter (OTC) derivatives clearinghouse and margin management system built on the [Canton Network](https://www.canton.io/) using the [Daml](https://www.daml.com/) smart contract language.
+This project provides a reference implementation for bilateral Over-The-Counter (OTC) derivatives clearing and margin management on the Canton Network, built using the Daml smart contract language.
 
-It models the entire lifecycle of a bilateral derivative trade, from affirmation and initial margin posting to daily variation margin settlement and final termination. The use of Canton ensures that all interactions are atomic, private, and auditable only by the authorized parties.
+It models the complete lifecycle of a derivative trade, from bilateral agreement and novation to a central clearinghouse, through daily variation margin calls, to final settlement or default management.
 
 ## Overview
 
-In traditional finance, OTC derivatives clearing is a complex process involving multiple intermediaries, reconciliation steps, and significant counterparty risk. This project demonstrates how a distributed ledger can streamline this process, reduce operational friction, and mitigate risk.
+The traditional OTC derivatives market is fragmented, opaque, and carries significant counterparty credit risk. This project demonstrates how a distributed ledger built on Canton can address these challenges by providing:
 
-**Key Benefits of this Daml/Canton Implementation:**
+*   **A Golden Source of Truth:** All parties to a trade share a single, synchronized view of the trade terms, margin requirements, and settlement status.
+*   **Atomic Settlement:** Canton's protocol ensures that complex, multi-party workflows like trade novation or margin settlement happen atomically—either all legs of the transaction succeed, or none do. This eliminates settlement risk.
+*   **Privacy by Design:** Trade details and margin positions are kept private to the involved counterparties and the clearinghouse. Information is not broadcast to the entire network.
+*   **Automation and Efficiency:** The entire trade lifecycle is encoded in Daml smart contracts, enabling robust automation of margin calls, collateral movements, and corporate actions, reducing operational overhead and risk.
 
-*   **Privacy by Design:** Trade details are known only to the two counterparties and the clearinghouse. Other participants on the network have no visibility.
-*   **Atomic Settlement:** Variation margin is settled using Delivery-vs-Payment (DvP) with Canton-native tokens, eliminating settlement risk. A margin payment and the corresponding update to the trade state occur in a single, atomic transaction.
-*   **Reduced Counterparty Risk:** The clearinghouse acts as a central counterparty (CCP), holding initial margin in a segregated, on-ledger account, which drastically reduces risk in the event of a default.
-*   **Golden Source of Truth:** All parties share a single, synchronized, and immutable record of every trade and margin movement, eliminating costly and error-prone reconciliations.
+For a detailed explanation of the clearing model and business logic, please see [docs/CLEARING_MODEL.md](docs/CLEARING_MODEL.md).
 
-## Features
+## Core Concepts & Roles
 
-*   **Bilateral Trade Affirmation:** A standard proposal/acceptance workflow for two counterparties to agree on the economic terms of a trade (e.g., Interest Rate Swap).
-*   **Centralized Clearing:** Affirmed trades are submitted to a clearinghouse party for clearing.
-*   **Initial Margin (IM) Management:** The clearinghouse calculates and holds IM for each trade in a dedicated on-ledger `MarginAccount`.
-*   **Variation Margin (VM) Workflow:**
-    *   Daily Mark-to-Market (MTM) values can be submitted.
-    *   VM requirements are calculated based on MTM changes.
-    *   On-ledger `MarginCall` contracts are issued to the party owing margin.
-    *   Margin calls are settled atomically using a DvP process against token collateral.
-*   **Trade Lifecycle:** Supports trade termination and novation.
+The system is designed around three primary roles:
 
-## Architecture
+1.  **Trading Counterparty:** An entity (e.g., a bank, hedge fund) that enters into derivative trades. They propose trades, post initial and variation margin, and view their positions.
+2.  **Clearinghouse (CCP):** A central counterparty that sits between the two trading counterparties. It novates the original bilateral trade, becoming the buyer to every seller and the seller to every buyer. The CCP calculates margin requirements, issues margin calls, and manages the default fund.
+3.  **Operator:** The party that operates the Daml application and the Canton node(s).
 
-The system is composed of two main components:
+The core workflow is managed through a set of Daml templates:
 
-1.  **Daml Model (`daml/`):** The core business logic is encapsulated in Daml smart contracts. These define the rights, obligations, and workflows for all participants. Key templates include:
-    *   `TradeAgreement`: Represents the confirmed economic terms between two counterparties.
-    *   `ClearingInstruction`: The instruction from counterparties to the clearinghouse to clear the trade.
-    *   `ClearedTrade`: The central contract representing the cleared trade, viewable by the counterparties and managed by the clearinghouse.
-    *   `MarginAccount`: Holds the initial margin collateral for a `ClearedTrade`.
-    *   `MarginCall`: Represents an obligation to post variation margin, which can be settled atomically.
+*   **`TradeProposal`**: An off-ledger agreement is captured on-ledger as a proposal from one counterparty to another.
+*   **`ClearedTrade`**: Once both counterparties and the clearinghouse agree, the original proposal is consumed and two new `ClearedTrade` contracts are created, representing the novated legs of the trade between each counterparty and the CCP.
+*   **`MarginAccount`**: Each counterparty has a margin account with the CCP, holding their posted initial margin.
+*   **`MarginCall`**: The CCP can issue daily margin calls to counterparties based on the mark-to-market (MTM) valuation of their trade portfolio. These calls must be met by posting variation margin.
+*   **`DefaultManagement`**: A set of contracts and choices to manage the orderly wind-down of a defaulting counterparty's portfolio.
 
-2.  **Frontend (`frontend/`):** A React-based web application that provides a user interface for counterparties and the clearinghouse. It communicates with a Canton participant node's JSON API to create contracts and exercise choices. It uses the `@c7/react` library for real-time ledger data streaming.
+## Getting Started (Developer Guide)
 
-## Prerequisites
+### Prerequisites
 
-Before you begin, ensure you have the following installed:
+*   **DPM (Digital Asset Package Manager)**: Version 3.4.0 or later. [Installation Instructions](https://docs.digitalasset.com/canton/stable/user-manual/dpm/install.html).
+*   **Node.js**: v18.x or later.
+*   **Yarn** or **npm**.
 
-*   **DPM (Digital Asset Package Manager) v3.4.0 or later:** The official Canton SDK and package manager.
-    ```bash
-    curl https://get.digitalasset.com/install/install.sh | sh
-    ```
-*   **Node.js and npm:** For running the frontend application. We recommend Node.js v18 or later.
+### 1. Clone the Repository
 
-## Getting Started: Local Development
-
-Follow these steps to run the full application stack on your local machine.
-
-**1. Clone the Repository**
-```bash
+```sh
 git clone https://github.com/digital-asset/canton-derivatives-clearing.git
 cd canton-derivatives-clearing
 ```
 
-**2. Build the Daml Model**
-This command compiles your Daml code into a DAR (Daml Archive) file.
-```bash
+### 2. Build the Daml Models
+
+Compile the Daml code into a DAR (Daml Archive) file.
+
+```sh
 dpm build
 ```
 The output will be located at `.daml/dist/canton-derivatives-clearing-0.1.0.dar`.
 
-**3. Start the Local Canton Ledger**
-This command starts a local Canton network (a "sandbox") and deploys the DAR file to it. The ledger's JSON API will be available on port `7575`.
-```bash
-dpm sandbox
-```
-The sandbox will also run the `Setup` script from `daml/Setup.daml`, which allocates a set of default parties (`Clearinghouse`, `BankA`, `BankB`) for demonstration purposes.
+### 3. Run Daml Script Tests
 
-**4. Install Frontend Dependencies**
-In a new terminal window, navigate to the `frontend` directory and install the required npm packages.
-```bash
-cd frontend
-npm install
-```
+Verify the business logic by running the automated tests.
 
-**5. Run the Frontend Application**
-```bash
-npm start
-```
-This will launch the React development server. Open your web browser to [http://localhost:3000](http://localhost:3000) to view the application. You will be able to log in as one of the pre-configured parties (`Clearinghouse`, `BankA`, or `BankB`) to interact with the system.
-
-## Running Tests
-
-The Daml model includes a suite of tests written in Daml Script. These tests verify the correctness of the contract logic and workflows.
-
-To run all tests:
-```bash
+```sh
 dpm test
 ```
+
+### 4. Start a Local Canton Ledger
+
+Run a local, single-node Canton instance for development and testing. This command also starts a JSON API gateway on port 7575.
+
+```sh
+dpm sandbox
+```
+
+The sandbox will automatically upload the DAR file built in step 2.
+
+### 5. Run the Frontend Application
+
+In a separate terminal, navigate to the `frontend` directory, install dependencies, and start the development server.
+
+```sh
+cd frontend
+npm install
+npm start
+```
+
+The application will be available at `http://localhost:3000`. You can log in using pre-allocated party names like `Alice`, `Bob`, or `CCP` to interact with the system.
 
 ## Project Structure
 
 ```
 .
-├── .github/workflows/ci.yml # GitHub Actions CI configuration
-├── daml/                      # Daml model source code
-│   ├── Clearing.daml          # Core clearinghouse logic and templates
-│   ├── Trade.daml             # Bilateral trade agreement logic
-│   ├── Margin.daml            # Margin account and margin call logic
-│   ├── Setup.daml             # Daml Script for initializing the ledger
-│   └── daml.yaml              # Daml package configuration
-├── frontend/                  # React frontend application
-│   ├── src/
-│   ├── package.json
-│   └── ...
-├── .gitignore
-├── LICENSE
-└── README.md                  # This file
+├── .github/workflows/ci.yml  # GitHub Actions CI pipeline
+├── daml/                     # Daml smart contract source code
+│   ├── Clearing.daml         # Clearinghouse and novation logic
+│   ├── DefaultManagement.daml# Counterparty default handling
+│   ├── Margin.daml           # Margin accounts and margin calls
+│   ├── Trade.daml            # Trade proposal and cleared trade contracts
+│   └── Test/                 # Daml Script tests
+├── docs/
+│   └── CLEARING_MODEL.md     # In-depth documentation of the business logic
+├── frontend/                 # React-based user interface
+├── daml.yaml                 # Daml project configuration
+└── README.md                 # This file
 ```
+
+## Operations Guide
+
+### Party Management
+
+On a production Canton network, parties are not pre-allocated. New trading counterparties must be onboarded by a participant node operator. This is typically done via the participant's admin API.
+
+For local development with `dpm sandbox`, parties are allocated from a predefined list in `daml.yaml` for ease of use.
+
+### Automation with Triggers
+
+In a production environment, many clearinghouse and counterparty actions would be automated. Daml Triggers are a powerful way to achieve this. Potential automations include:
+*   **Margin Call Generation:** A trigger running on the CCP's node could connect to an external price feed (e.g., via a REST API) to fetch daily MTM prices, calculate variation margin requirements for all counterparties, and automatically create `MarginCall` contracts on the ledger.
+*   **Margin Payment Processing:** A counterparty's trigger could listen for new `MarginCall` contracts and automatically initiate a payment instruction to meet the call, for example by exercising a choice on a `Cash` or `Token` contract.
+*   **Trade Acceptance:** A counterparty could run a trigger that automatically accepts incoming `TradeProposal` contracts that meet certain predefined criteria.
+
+Triggers are run as separate processes that connect to the ledger's gRPC API.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to open a pull request or submit an issue.
+Contributions are welcome! Please follow the standard GitHub flow:
 
-When contributing, please ensure that:
-1. Your code is formatted correctly (`daml format` for Daml, `npm run format` for TypeScript).
-2. All existing and new tests pass (`dpm test`).
-3. Your commit messages are clear and descriptive.
+1.  Fork the repository.
+2.  Create a new feature branch (`git checkout -b my-feature`).
+3.  Make your changes.
+4.  Ensure the tests pass (`dpm test`).
+5.  Commit your changes (`git commit -am 'Add some feature'`).
+6.  Push to the branch (`git push origin my-feature`).
+7.  Create a new Pull Request.
 
 ## License
 
-This project is licensed under the Apache License 2.0. See the [LICENSE](./LICENSE) file for details.
+This project is licensed under the [Apache 2.0 License](LICENSE).
