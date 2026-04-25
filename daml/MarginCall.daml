@@ -4,138 +4,217 @@
 module MarginCall where
 
 import Daml.Script
-import DA.Date (Date, date)
-import DA.Time (Time, RelTime, addRelTime, time, days, hours, minutes)
-import DefaultManagement (DefaultNotice)
+import DA.Date
+import DA.Assert
+import DA.Optional
 
--- | Represents an outstanding variation margin call for a specific trade on a given valuation date.
--- The clearinghouse creates this contract to notify the 'payer' of their obligation to post margin
--- to the 'receiver'. The obligation must be settled by the 'settlementDeadline'.
+-- | Represents an obligation for a party to post variation margin. This contract
+-- is typically created by a Central Counterparty (CCP) as part of the daily
+-- mark-to-market process for a cleared derivative trade.
 template MarginCall
   with
-    clearinghouse: Party
-      -- ^ The central counterparty managing the margin process.
+    ccp: Party
+      -- ^ The Central Counterparty issuing the call.
     payer: Party
-      -- ^ The party obligated to post the variation margin.
-    receiver: Party
-      -- ^ The party due to receive the variation margin.
+      -- ^ The clearing member obligated to post margin.
     tradeId: Text
-      -- ^ The unique identifier of the underlying derivative trade.
-    marginAmount: Decimal
-      -- ^ The amount of variation margin to be paid. Must be positive.
-    valuationDate: Date
-      -- ^ The date for which the mark-to-market valuation was calculated.
-    settlementDeadline: Time
-      -- ^ The timestamp by which the margin payment must be completed.
+      -- ^ Identifier for the underlying cleared trade, linking this call to a specific position.
+    currency: Text
+      -- ^ The currency of the margin requirement.
+    requiredAmount: Decimal
+      -- ^ The amount of margin required to be posted.
+    dueDate: Date
+      -- ^ The date by which the margin must be posted to avoid a default event.
   where
-    signatory clearinghouse, payer
-    observer receiver
+    signatory ccp, payer
 
-    ensure marginAmount > 0.0
+    ensure requiredAmount > 0.0
 
-    key (clearinghouse, tradeId, valuationDate) : (Party, Text, Date)
-    maintainer key._1
-
-    -- | Choice exercised by the clearinghouse to confirm that the margin payment has been
-    -- successfully received. This completes the margin call lifecycle for this period.
-    choice AcknowledgeSettlement : ()
-      controller clearinghouse
+    -- | The choice for the `payer` to post margin against this call.
+    -- This handles both full and partial settlement.
+    -- If the posted amount is less than required, the existing call is archived
+    -- and a new one is created for the remaining balance.
+    -- If the posted amount is sufficient, the call is simply archived.
+    -- The actual transfer of funds is handled by a higher-level contract (e.g., ClearingHouse)
+    -- which would exercise this choice as part of a larger atomic transaction.
+    choice PostMargin : Optional (ContractId MarginCall)
+      controller payer
+      with
+        postedAmount: Decimal
+          -- ^ The amount of margin being posted.
       do
-        archive self
+        assertMsg "Posted amount must be positive." (postedAmount > 0.0)
 
-    -- | Choice exercised by the clearinghouse if the 'payer' fails to meet the margin call
-    -- by the 'settlementDeadline'. This archives the margin call and initiates the
-    -- default management process by creating a 'DefaultNotice'.
-    choice DeclareDefault : ContractId DefaultNotice
-      controller clearinghouse
+        if postedAmount < requiredAmount then do
+          -- Partial settlement: create a new margin call for the remainder.
+          let remainingAmount = requiredAmount - postedAmount
+          newMarginCallCid <- create this with requiredAmount = remainingAmount
+          return (Some newMarginCallCid)
+        else do
+          -- Full settlement (including over-payment): the obligation is met.
+          -- Any excess amount posted is not handled here; it's the responsibility of the
+          -- calling contract's cash management logic.
+          return None
+
+    -- | Allows the CCP to cancel an overdue call, typically to trigger a default process.
+    -- This choice would be exercised when the `payer` fails to respond by the `dueDate`.
+    choice CancelOverdueCall : ()
+      controller ccp
+      with
+        currentDate: Date
+          -- ^ The current date, provided to enforce the due date constraint.
       do
-        now <- getTime
-        assertMsg "Cannot declare default before the settlement deadline has passed."
-          (now >= settlementDeadline)
+        assertMsg ("Cannot cancel margin call before its due date: " <> show dueDate) (currentDate > dueDate)
+        -- In a full implementation, this would likely create a contract to initiate
+        -- the default management workflow defined in `DefaultManagement.daml`.
+        -- For example: `create DefaultNotice with ccp, defaultingParty = payer, ...`
+        return ()
 
-        create DefaultNotice with
-          defaultingParty = payer
-          nonDefaultingParty = receiver
-          clearinghouse = clearinghouse
-          tradeId = tradeId
-          reason = "Failure to meet variation margin call on " <> show valuationDate <> "."
+-- | An event contract to represent a fully settled margin call for archival and
+-- reporting purposes.
+template MarginCallSettled
+  with
+    ccp: Party
+    payer: Party
+    tradeId: Text
+    currency: Text
+    settledAmount: Decimal
+    settlementDate: Date
+  where
+    signatory ccp, payer
 
--- | Daml Script for testing the MarginCall template and its lifecycle.
-test_MarginCallLifecycle : Script ()
-test_MarginCallLifecycle = script do
-  -- 1. Allocate parties
-  ch <- allocatePartyWithHint "Clearinghouse" (PartyIdHint "clearinghouse")
+-- | An event contract to represent a partially settled margin call for archival and
+-- reporting purposes.
+template MarginCallPartiallySettled
+  with
+    ccp: Party
+    payer: Party
+    tradeId: Text
+    currency: Text
+    postedAmount: Decimal
+    remainingAmount: Decimal
+    settlementDate: Date
+  where
+    signatory ccp, payer
+
+
+-- === Test Cases ===
+
+marginCallTests : Script ()
+marginCallTests = script do
+  ccp <- allocatePartyWithHint "CCP" (PartyIdHint "ccp")
   alice <- allocatePartyWithHint "Alice" (PartyIdHint "alice")
-  bob <- allocatePartyWithHint "Bob" (PartyIdHint "bob")
 
-  -- 2. Define parameters for the margin call
-  let tradeId = "ISDA-2024-001"
-  let valuationDate = date 2024 Feb 26
-  let marginAmount = 100_000.00
+  let today = date 2024 Sep 10
+  let tomorrow = addDays today 1
 
-  -- 3. Set up time variables. The test will run at a specific time.
-  let submissionTime = time valuationDate 9 0 0
-  let settlementDeadline = addRelTime submissionTime (days 1) -- T+1 settlement at 09:00 UTC
+  test "Scenario: Full Settlement" do
+    let initialAmount = 1_000_000.0
+    marginCallCid <- submit ccp do
+      create MarginCall with
+        ccp, payer = alice, tradeId = "TRADE-001", currency = "USD"
+        requiredAmount = initialAmount, dueDate = tomorrow
 
-  -- 4. Test success path: Clearinghouse creates call, then acknowledges settlement.
-  -- Submit the command at the submissionTime.
-  marginCallCid <- submit ch at submissionTime do
-    createCmd MarginCall with
-      clearinghouse = ch
-      payer = alice
-      receiver = bob
-      tradeId = tradeId
-      marginAmount = marginAmount
-      valuationDate = valuationDate
-      settlementDeadline = settlementDeadline
+    -- Alice posts the full amount.
+    mbResidualCallCid <- submit alice do
+      exercise marginCallCid PostMargin with postedAmount = initialAmount
 
-  -- The payer (Alice) can see the contract.
-  aliceContracts <- query @MarginCall alice
-  assert (length aliceContracts == 1)
+    -- The margin call should be fully settled, so no residual contract is created.
+    mbResidualCallCid === None
 
-  -- The receiver (Bob) can see the contract.
-  bobContracts <- query @MarginCall bob
-  assert (length bobContracts == 1)
+    -- The original contract should be archived.
+    (submitMustFail ccp (fetch marginCallCid))
 
-  -- Clearinghouse acknowledges settlement before the deadline.
-  let settlementTime = addRelTime submissionTime (hours 4)
-  submit ch at settlementTime do
-    exerciseCmd marginCallCid AcknowledgeSettlement
+    -- The calling process (e.g., a ClearingHouse contract) would then create a settlement event.
+    submit ccp do
+      create MarginCallSettled with
+        ccp, payer = alice, tradeId = "TRADE-001", currency = "USD"
+        settledAmount = initialAmount, settlementDate = today
+    pure ()
 
-  -- Verify the margin call contract has been archived.
-  chContractsAfterSettle <- query @MarginCall ch
-  assert (length chContractsAfterSettle == 0)
-  aliceContractsAfterSettle <- query @MarginCall alice
-  assert (length aliceContractsAfterSettle == 0)
 
-  -- 5. Test default path: Clearinghouse creates call, deadline passes, CH declares default.
-  marginCallCid2 <- submit ch at submissionTime do
-    createCmd MarginCall with
-      clearinghouse = ch
-      payer = bob -- This time Bob is the payer
-      receiver = alice
-      tradeId = tradeId <> "-002"
-      marginAmount = 50_000.00
-      valuationDate = valuationDate
-      settlementDeadline = settlementDeadline
+  test "Scenario: Partial Settlement" do
+    let initialAmount = 500_000.0
+    let postedAmount = 200_000.0
+    let expectedRemaining = 300_000.0
 
-  -- Attempt to declare default before the deadline should fail.
-  let earlyDefaultTime = addRelTime settlementDeadline (minutes (-10))
-  submitMustFail ch at earlyDefaultTime do
-    exerciseCmd marginCallCid2 DeclareDefault
+    marginCallCid <- submit ccp do
+      create MarginCall with
+        ccp, payer = alice, tradeId = "TRADE-002", currency = "USD"
+        requiredAmount = initialAmount, dueDate = tomorrow
 
-  -- Advance time to after the deadline and declare default.
-  let lateDefaultTime = addRelTime settlementDeadline (minutes 10)
-  defaultNoticeCid <- submit ch at lateDefaultTime do
-    exerciseCmd marginCallCid2 DeclareDefault
+    -- Alice posts a partial amount.
+    mbResidualCallCid <- submit alice do
+      exercise marginCallCid PostMargin with postedAmount
 
-  -- Verify the margin call is archived and a default notice exists.
-  chContractsAfterDefault <- query @MarginCall ch
-  assert (length chContractsAfterDefault == 0)
+    -- A residual margin call should be created for the outstanding amount.
+    case mbResidualCallCid of
+      None -> fail "Expected a residual margin call contract, but got None."
+      Some residualCallCid -> do
+        residualCall <- submit ccp (fetch residualCallCid)
+        residualCall.requiredAmount === expectedRemaining
+        residualCall.payer === alice
+        residualCall.tradeId === "TRADE-002"
 
-  defaultNotice <- fetch defaultNoticeCid
-  assert (defaultNotice.defaultingParty == bob)
-  assert (defaultNotice.nonDefaultingParty == alice)
-  assert (defaultNotice.clearinghouse == ch)
+    -- The original contract should be archived.
+    (submitMustFail ccp (fetch marginCallCid))
 
-  pure ()
+    -- The calling process would create a partial settlement event for its records.
+    submit ccp do
+      create MarginCallPartiallySettled with
+        ccp, payer = alice, tradeId = "TRADE-002", currency = "USD"
+        postedAmount, remainingAmount = expectedRemaining, settlementDate = today
+    pure ()
+
+  test "Scenario: Over-Settlement" do
+    let initialAmount = 750_000.0
+    let postedAmount = 800_000.0
+
+    marginCallCid <- submit ccp do
+      create MarginCall with
+        ccp, payer = alice, tradeId = "TRADE-003", currency = "USD"
+        requiredAmount = initialAmount, dueDate = tomorrow
+
+    -- Alice posts more than the required amount.
+    mbResidualCallCid <- submit alice do
+      exercise marginCallCid PostMargin with postedAmount
+
+    -- This is still considered a full settlement of the obligation. The contract
+    -- is archived and no residual call is created.
+    mbResidualCallCid === None
+
+    -- The original contract should be archived.
+    (submitMustFail ccp (fetch marginCallCid))
+
+    -- The settlement event logs the required amount, not the overpayment, as that
+    -- is what the obligation was for.
+    submit ccp do
+      create MarginCallSettled with
+        ccp, payer = alice, tradeId = "TRADE-003", currency = "USD"
+        settledAmount = initialAmount, settlementDate = today
+    pure ()
+
+  test "Failing Scenario: Post Zero Amount" do
+    marginCallCid <- submit ccp do
+      create MarginCall with
+        ccp, payer = alice, tradeId = "TRADE-004", currency = "USD"
+        requiredAmount = 100.0, dueDate = tomorrow
+    submitMustFail alice (exercise marginCallCid PostMargin with postedAmount = 0.0)
+
+  test "Failing Scenario: Cancel Before Due Date" do
+    marginCallCid <- submit ccp do
+      create MarginCall with
+        ccp, payer = alice, tradeId = "TRADE-005", currency = "USD"
+        requiredAmount = 100.0, dueDate = tomorrow
+    submitMustFail ccp (exercise marginCallCid CancelOverdueCall with currentDate = today)
+
+  test "Scenario: Cancel After Due Date" do
+    let yesterday = addDays today (-1)
+    marginCallCid <- submit ccp do
+      create MarginCall with
+        ccp, payer = alice, tradeId = "TRADE-006", currency = "USD"
+        requiredAmount = 100.0, dueDate = yesterday
+
+    -- This should succeed as the current date is after the due date.
+    submit ccp (exercise marginCallCid CancelOverdueCall with currentDate = today)
+    pure ()
